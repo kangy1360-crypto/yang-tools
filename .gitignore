@@ -1,0 +1,9 @@
+﻿.venv/
+__pycache__/
+_diag_tmp/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.bak

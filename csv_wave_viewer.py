@@ -1,13 +1,174 @@
 ﻿import argparse
+import faulthandler
 import json
+import logging
 import os
 import sys
+import threading
+import traceback
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
+
+
+
+APP_NAME = "CSV\u591a\u4fe1\u53f7\u6ce2\u5f62\u67e5\u770b\u5668"
+_LOGGER: Optional[logging.Logger] = None
+_LOG_FILE_PATH: Optional[str] = None
+_LAST_ERROR_SHOWN = {"active": False, "last_ts": 0.0}
+
+
+def _get_log_file_path() -> str:
+    global _LOG_FILE_PATH
+    if _LOG_FILE_PATH is not None:
+        return _LOG_FILE_PATH
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(base_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _LOG_FILE_PATH = os.path.join(log_dir, f"runtime_{ts}.log")
+    return _LOG_FILE_PATH
+
+
+def setup_runtime_diagnostics() -> str:
+    global _LOGGER
+    log_path = _get_log_file_path()
+    logger = logging.getLogger("csv_wave_viewer")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(fh)
+    logger.propagate = False
+    _LOGGER = logger
+    logger.info("==== \u7a0b\u5e8f\u542f\u52a8 ====")
+    logger.info("Python=%s", sys.version.replace("\n", " "))
+    logger.info("argv=%s", sys.argv)
+    try:
+        crash_path = os.path.join(os.path.dirname(log_path), "crash_dump.log")
+        crash_file = open(crash_path, "a", encoding="utf-8")
+        faulthandler.enable(file=crash_file, all_threads=True)
+        logger.info("faulthandler enabled: %s", crash_path)
+    except Exception as exc:
+        logger.warning("faulthandler enable failed: %s", exc)
+    return log_path
+
+
+def _log_exception_block(title: str, detail: str) -> None:
+    if _LOGGER is not None:
+        _LOGGER.error("%s\n%s", title, detail)
+    else:
+        print(f"{title}\n{detail}", file=sys.stderr)
+
+
+def _show_runtime_error_dialog(title: str, detail: str) -> None:
+    import time
+
+    now = time.time()
+    if now - float(_LAST_ERROR_SHOWN.get("last_ts", 0.0)) < 2.0:
+        return
+    if _LAST_ERROR_SHOWN["active"]:
+        return
+
+    _LAST_ERROR_SHOWN["last_ts"] = now
+    _LAST_ERROR_SHOWN["active"] = True
+    try:
+        log_path = _get_log_file_path()
+        msg = (
+            f"{title}\n\n"
+            f"\u7a0b\u5e8f\u5df2\u8bb0\u5f55\u65e5\u5fd7\uff0c\u8def\u5f84\uff1a\n{log_path}\n\n"
+            "\u8bf7\u628a\u8be5\u65e5\u5fd7\u6587\u4ef6\u6216\u622a\u56fe\u53d1\u7ed9\u6211\uff0c\u6211\u53ef\u4ee5\u5feb\u901f\u5b9a\u4f4d\u3002"
+        )
+        QtWidgets.QMessageBox.critical(None, APP_NAME + " \u8fd0\u884c\u9519\u8bef", msg)
+    except Exception:
+        pass
+    finally:
+        _LAST_ERROR_SHOWN["active"] = False
+
+
+def install_exception_hooks() -> None:
+    def should_suppress(exc_type, detail: str) -> bool:
+        # pyqtgraph????????????????????????????
+        if exc_type is AttributeError and "autoRangeEnabled" in detail and "GraphicsLayoutWidget" in detail:
+            return True
+        return False
+
+    def handle_sys_exception(exc_type, exc_value, exc_tb):
+        detail = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        if should_suppress(exc_type, detail):
+            if _LOGGER is not None:
+                _LOGGER.warning("\u5df2\u6291\u5236\u5df2\u77e5\u5185\u90e8\u5f02\u5e38: %s", detail.splitlines()[-1] if detail else "")
+            return
+        _log_exception_block("\u672a\u6355\u83b7\u5f02\u5e38(sys.excepthook)", detail)
+        _show_runtime_error_dialog("\u53d1\u751f\u672a\u6355\u83b7\u5f02\u5e38", detail)
+
+    def handle_thread_exception(args):
+        detail = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        _log_exception_block(f"\u7ebf\u7a0b\u5f02\u5e38({args.thread.name})", detail)
+        _show_runtime_error_dialog("\u540e\u53f0\u7ebf\u7a0b\u53d1\u751f\u5f02\u5e38", detail)
+
+    def handle_qt_message(mode, context, message):
+        if mode == QtCore.QtFatalMsg:
+            level = "FATAL"
+        elif mode == QtCore.QtCriticalMsg:
+            level = "CRITICAL"
+        elif mode == QtCore.QtWarningMsg:
+            level = "WARNING"
+        elif mode == QtCore.QtInfoMsg:
+            level = "INFO"
+        else:
+            level = "DEBUG"
+        if _LOGGER is not None:
+            _LOGGER.info("Qt[%s] %s", level, message)
+        if mode in (QtCore.QtFatalMsg, QtCore.QtCriticalMsg):
+            _show_runtime_error_dialog(f"Qt\u8fd0\u884c\u6d88\u606f: {level}", str(message))
+
+    sys.excepthook = handle_sys_exception
+    try:
+        threading.excepthook = handle_thread_exception
+    except Exception:
+        pass
+    QtCore.qInstallMessageHandler(handle_qt_message)
+
+
+class ConciseDateAxisItem(pg.DateAxisItem):
+    """简洁时间轴：同日显示时分，跨日或关键刻度补充日期。"""
+
+    def tickStrings(self, values, scale, spacing):
+        try:
+            spacing = float(spacing)
+        except Exception:
+            spacing = 0.0
+
+        out = []
+        prev_day = None
+        for v in values:
+            try:
+                dt = pd.to_datetime(float(v), unit="s", utc=True).to_pydatetime()
+            except Exception:
+                out.append("")
+                continue
+
+            day = dt.date()
+            if spacing >= 86400:  # 天级
+                text = dt.strftime("%m-%d")
+            elif spacing >= 3600:  # 小时级
+                if prev_day is None or day != prev_day:
+                    text = dt.strftime("%m-%d %H:%M")
+                else:
+                    text = dt.strftime("%H:%M")
+            else:  # 分钟/秒级
+                if prev_day is None or day != prev_day:
+                    text = dt.strftime("%m-%d %H:%M")
+                else:
+                    text = dt.strftime("%H:%M:%S")
+            out.append(text)
+            prev_day = day
+        return out
 
 
 def detect_time_column(columns: List[str]) -> Optional[str]:
@@ -265,18 +426,27 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         layout.addWidget(self.left_panel, 0)
         layout.addWidget(self.plot_value_splitter, 1)
         self.setCentralWidget(central)
-        self.plot_value_splitter.setSizes([1200, 320])
+        self.plot_value_splitter.setSizes([980, 520])
 
         self.plot_items = []
         self.plot_cols: List[str] = []
         self.curves = {}
         self.vlines = []
+        self.overview_plot = None
         self.hover_proxy = None
         self.selected_cols: List[str] = []
         self._syncing_from_region = False
         self._syncing_from_plot = False
         self.favorites_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "favorites.json")
         self.favorites = self._read_favorites()
+        self.marker_snapshots = [None, None, None]
+        self.marker_next_slot = 0
+        self.marker_colors = [(230, 80, 80), (80, 150, 240), (70, 170, 90)]
+        self.marker_slot_lines = [[], [], []]
+        self.marker_bottom_label_items = [None, None, None]
+        self.marker_bottom_xs = None
+        self.marker_delete_targets = []
+        self._menu_localizing = False
 
         self.load_thread = None
         self.load_worker = None
@@ -395,23 +565,67 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         vbox = QtWidgets.QVBoxLayout(panel)
         vbox.setContentsMargins(10, 10, 10, 10)
         vbox.setSpacing(6)
+        self.value_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.value_splitter.setChildrenCollapsible(False)
+        self.value_splitter.setHandleWidth(6)
 
+        current_widget = QtWidgets.QWidget()
+        current_layout = QtWidgets.QVBoxLayout(current_widget)
+        current_layout.setContentsMargins(0, 0, 0, 0)
+        current_layout.setSpacing(4)
         title = QtWidgets.QLabel("当前光标数值")
         title.setStyleSheet("font-weight: bold;")
-        vbox.addWidget(title)
-
+        current_layout.addWidget(title)
         self.value_display = QtWidgets.QPlainTextEdit()
         self.value_display.setReadOnly(True)
         self.value_display.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.value_display.setPlainText("鼠标移动到波形区域后，这里会显示当前时刻各信号值。")
-        vbox.addWidget(self.value_display, 1)
+        current_layout.addWidget(self.value_display, 1)
+        self.value_splitter.addWidget(current_widget)
+
+        self.marker_time_labels = []
+        self.marker_text_edits = []
+        for i in range(3):
+            group = QtWidgets.QGroupBox(f"标记点{i + 1}")
+            gv = QtWidgets.QVBoxLayout(group)
+            gv.setContentsMargins(8, 8, 8, 8)
+            gv.setSpacing(4)
+
+            if i == 0:
+                hint = QtWidgets.QLabel("左键点击任意波形可冻结；在图中“标记点N ×”处删除。")
+                hint.setStyleSheet("color: #666;")
+                hint.setWordWrap(True)
+                gv.addWidget(hint)
+
+            tlabel = QtWidgets.QLabel("未标记")
+            tlabel.setStyleSheet("color: #555;")
+            gv.addWidget(tlabel)
+
+            edit = QtWidgets.QPlainTextEdit()
+            edit.setReadOnly(True)
+            edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+            edit.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            edit.setMinimumHeight(120)
+            edit.setPlainText("（空）")
+            gv.addWidget(edit, 1)
+
+            self.marker_time_labels.append(tlabel)
+            self.marker_text_edits.append(edit)
+            self.value_splitter.addWidget(group)
+
+        vbox.addWidget(self.value_splitter, 1)
+        self.value_splitter.setSizes([240, 220, 220, 220])
+
+        self.btn_clear_all_markers = QtWidgets.QPushButton("清空全部标记")
+        self.btn_clear_all_markers.clicked.connect(self._clear_all_markers)
+        vbox.addWidget(self.btn_clear_all_markers, 0)
         return panel
 
     def _make_axis_items(self) -> Optional[dict]:
         if not self.is_time_axis:
             return None
         # 强制按 UTC 基准显示，避免系统时区导致 +8/-8 小时偏移
-        return {"bottom": pg.DateAxisItem(orientation="bottom", utcOffset=0)}
+        return {"bottom": ConciseDateAxisItem(orientation="bottom", utcOffset=0)}
 
     def _bind_left_signals(self) -> None:
         self.signal_list.itemChanged.connect(self._on_signal_item_changed)
@@ -421,6 +635,76 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.btn_fav_save.clicked.connect(self._save_current_favorite)
         self.btn_fav_apply.clicked.connect(self._apply_selected_favorite)
         self.btn_fav_delete.clicked.connect(self._delete_selected_favorite)
+
+    def _localize_menu_recursive(self, menu: QtWidgets.QMenu) -> None:
+        if self._menu_localizing:
+            return
+        self._menu_localizing = True
+        mapping = {
+            "View All": "查看全部",
+            "X axis": "X轴",
+            "Y axis": "Y轴",
+            "Mouse Mode": "鼠标模式",
+            "Plot Options": "图形选项",
+            "Export...": "导出...",
+            "Transforms": "变换",
+            "Downsample": "降采样",
+            "Average": "平均",
+            "Alpha": "透明度",
+            "Grid": "网格",
+            "Points": "点",
+            "Pan": "平移",
+            "Zoom": "缩放",
+            "3 button": "三键模式",
+            "1 button": "单键模式",
+            "Link axis": "关联坐标轴",
+            "Link Axis": "关联坐标轴",
+            "Link X axis": "关联X轴",
+            "Link Y axis": "关联Y轴",
+            "Auto": "自动",
+            "Manual": "手动",
+            "Off": "关闭",
+            "Value": "数值",
+            "Visible": "可见",
+            "Auto Pan": "自动平移",
+            "Invert Axis": "反转坐标轴",
+            "Mouse Enabled": "允许鼠标交互",
+        }
+
+        def translate_text(txt: str) -> str:
+            raw = txt or ""
+            key = raw.strip().replace("&", "")
+            if key in mapping:
+                return mapping[key]
+            for src, dst in mapping.items():
+                if key.startswith(src + ":"):
+                    return key.replace(src + ":", dst + ":", 1)
+            return raw
+
+        try:
+            for act in menu.actions():
+                txt = act.text()
+                new_txt = translate_text(txt)
+                if new_txt != txt and new_txt != "":
+                    act.setText(new_txt)
+                sub = act.menu()
+                if sub is not None:
+                    self._localize_menu_recursive(sub)
+        finally:
+            self._menu_localizing = False
+
+    def _install_menu_localizer(self, menu: QtWidgets.QMenu) -> None:
+        # 保留接口，当前不再挂动态钩子，避免菜单展开时卡顿
+        return
+
+    def _localize_plot_context_menu(self, plot_item) -> None:
+        vb = plot_item.getViewBox()
+        try:
+            menu = vb.getMenu(None)
+            if menu is not None:
+                self._localize_menu_recursive(menu)
+        except Exception:
+            pass
 
     def _set_data(self, df: pd.DataFrame, time_col: Optional[str]) -> None:
         self.df = df
@@ -443,6 +727,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
         self._bind_left_signals()
         self._update_selected_count()
+        self._clear_all_markers(silent=True)
         self._init_plots()
 
     def _open_csv_dialog(self) -> None:
@@ -671,6 +956,10 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.plot_cols.clear()
         self.curves.clear()
         self.vlines.clear()
+        self.marker_slot_lines = [[], [], []]
+        self.marker_bottom_label_items = [None, None, None]
+        self.marker_bottom_xs = None
+        self.marker_delete_targets = []
 
         checked_cols = self._get_checked_columns()
         self.selected_cols = checked_cols
@@ -695,7 +984,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             curve = p.plot(
                 self.x_display,
                 y,
-                pen=pg.mkPen(color=pg.intColor(i, hues=max(8, len(checked_cols))), width=1),
+                pen=pg.mkPen(color=pg.intColor(i, hues=max(8, len(checked_cols))), width=2),
                 autoDownsample=True,
                 downsampleMethod="peak",
                 clipToView=True,
@@ -704,6 +993,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
             if i > 0:
                 p.setXLink(self.plot_items[0])
+                p.hideAxis("bottom")
             else:
                 p.setLabel("bottom", "时间" if self.is_time_axis else "样本点")
 
@@ -712,6 +1002,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             self.vlines.append(vline)
             self.plot_items.append(p)
             self.plot_cols.append(col)
+            self._localize_plot_context_menu(p)
 
         overview_row = len(checked_cols)
         axis_items = self._make_axis_items()
@@ -724,15 +1015,28 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
         self.overview_plot.showGrid(x=True, y=True, alpha=0.2)
         self.overview_plot.setMaximumHeight(180)
+        self.overview_plot.disableAutoRange(axis=pg.ViewBox.XAxis)
+        self._localize_plot_context_menu(self.overview_plot)
 
         first_col = checked_cols[0]
         y_overview = pd.to_numeric(self.df[first_col], errors="coerce").to_numpy(dtype=np.float64)
         self.overview_plot.plot(self.x_display, y_overview, pen=pg.mkPen((120, 120, 120), width=1))
 
+        # 每个标记点在所有子图保留一条固定竖线
+        for p in self.plot_items:
+            for slot, color in enumerate(self.marker_colors):
+                mline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen(color=color, width=1.2))
+                mline.hide()
+                p.addItem(mline, ignoreBounds=True)
+                self.marker_slot_lines[slot].append(mline)
+
         x_min = float(np.nanmin(self.x_display))
         x_max = float(np.nanmax(self.x_display))
         if not np.isfinite(x_min) or not np.isfinite(x_max) or x_min == x_max:
             x_min, x_max = 0.0, max(1.0, float(len(self.x_display) - 1))
+        self._x_domain_min = x_min
+        self._x_domain_max = x_max
+        self.overview_plot.setXRange(x_min, x_max, padding=0)
 
         initial_left = x_min + (x_max - x_min) * 0.15
         initial_right = x_min + (x_max - x_min) * 0.65
@@ -746,12 +1050,30 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.region.sigRegionChanged.connect(self._on_region_changed)
         self._on_region_changed()
 
+        # 在最后一张波形图底部显示“标记点N + ×”并可点×删除
+        if self.plot_items:
+            bottom_plot = self.plot_items[-1]
+            self.marker_bottom_xs = pg.ScatterPlotItem(size=10, symbol="x", pen=pg.mkPen((200, 50, 50), width=1.8))
+            self.marker_bottom_xs.sigClicked.connect(self._on_bottom_marker_x_clicked)
+            bottom_plot.addItem(self.marker_bottom_xs)
+            for slot in range(3):
+                txt = pg.TextItem(anchor=(0.5, 1.0), color=self.marker_colors[slot])
+                txt.hide()
+                bottom_plot.addItem(txt)
+                self.marker_bottom_label_items[slot] = txt
+        self._refresh_marker_graphics()
+
         if self.hover_proxy is not None:
             try:
                 self.hover_proxy.disconnect()
             except Exception:
                 pass
         self.hover_proxy = pg.SignalProxy(self.plot_items[0].scene().sigMouseMoved, rateLimit=60, slot=self._mouse_moved)
+        try:
+            self.plot_items[0].scene().sigMouseClicked.disconnect(self._mouse_clicked)
+        except Exception:
+            pass
+        self.plot_items[0].scene().sigMouseClicked.connect(self._mouse_clicked)
         for p in self.plot_items:
             p.vb.sigXRangeChanged.connect(self._on_main_xrange_changed)
         self._update_all_y_ranges()
@@ -825,6 +1147,18 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         if not self.plot_items:
             return
         left, right = self.region.getRegion()
+        if hasattr(self, "_x_domain_min") and hasattr(self, "_x_domain_max"):
+            x_min = float(self._x_domain_min)
+            x_max = float(self._x_domain_max)
+            left = max(x_min, min(left, x_max))
+            right = max(x_min, min(right, x_max))
+            if left > right:
+                left, right = right, left
+            cur_left, cur_right = self.region.getRegion()
+            if abs(cur_left - left) > 1e-9 or abs(cur_right - right) > 1e-9:
+                self.region.blockSignals(True)
+                self.region.setRegion((left, right))
+                self.region.blockSignals(False)
         if not self._syncing_from_plot:
             self._syncing_from_region = True
             try:
@@ -832,6 +1166,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                     p.setXRange(left, right, padding=0)
             finally:
                 self._syncing_from_region = False
+        self._refresh_marker_graphics()
         self._update_all_y_ranges()
 
     def _on_main_xrange_changed(self, _vb, ranges) -> None:
@@ -900,16 +1235,47 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
         idx = int(np.searchsorted(self.x_display, x_val))
         idx = max(0, min(idx, len(self.x_display) - 1))
+        self._update_current_value_panel(idx)
 
-        x_actual = self.x_display[idx]
-        for line in self.vlines:
-            line.setPos(x_actual)
+    def _mouse_clicked(self, evt) -> None:
+        if not self.plot_items:
+            return
+        try:
+            if evt.button() != QtCore.Qt.LeftButton:
+                return
+            pos = evt.scenePos()
+        except Exception:
+            return
 
-        lines = []
+        if self._try_delete_marker_from_scene_click(pos):
+            return
+
+        active_plot = None
+        for p in self.plot_items:
+            if p.sceneBoundingRect().contains(pos):
+                active_plot = p
+                break
+        if active_plot is None:
+            return
+
+        point = active_plot.vb.mapSceneToView(pos)
+        idx = int(np.searchsorted(self.x_display, float(point.x())))
+        idx = max(0, min(idx, len(self.x_display) - 1))
+        self._freeze_marker_at_index(idx)
+
+    def _format_time_text(self, x_actual: float) -> str:
         if self.is_time_axis:
             ts_ms = int(round(x_actual * 1000.0))
-            ts_text = pd.to_datetime(ts_ms, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            lines.append(f"时间: {ts_text}")
+            return pd.to_datetime(ts_ms, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        idx = int(np.searchsorted(self.x_display, x_actual))
+        idx = max(0, min(idx, len(self.x_display) - 1))
+        return f"样本: {idx}"
+
+    def _build_value_lines(self, idx: int) -> List[str]:
+        x_actual = self.x_display[idx]
+        lines = []
+        if self.is_time_axis:
+            lines.append(f"时间: {self._format_time_text(x_actual)}")
         else:
             lines.append(f"样本: {idx}")
 
@@ -923,8 +1289,135 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 except Exception:
                     sval = str(val)
             lines.append(f"{col}: {sval}")
+        return lines
 
+    def _update_current_value_panel(self, idx: int) -> None:
+        x_actual = self.x_display[idx]
+        for line in self.vlines:
+            line.setPos(x_actual)
+        lines = self._build_value_lines(idx)
         self.value_display.setPlainText("\n".join(lines))
+
+    def _freeze_marker_at_index(self, idx: int) -> None:
+        slot = self.marker_next_slot
+        x_actual = self.x_display[idx]
+        self.marker_snapshots[slot] = {
+            "x": float(x_actual),
+            "time": self._format_time_text(x_actual),
+            "text": "\n".join(self._build_value_lines(idx)),
+        }
+        self.marker_next_slot = (self.marker_next_slot + 1) % len(self.marker_snapshots)
+        self._refresh_marker_views()
+        self.statusBar().showMessage(f"已记录标记点{slot + 1}")
+
+    def _refresh_marker_views(self) -> None:
+        for i, snap in enumerate(self.marker_snapshots):
+            if snap is None:
+                self.marker_time_labels[i].setText("未标记")
+                self.marker_text_edits[i].setPlainText("（空）")
+                continue
+            self.marker_time_labels[i].setText(snap["time"])
+            self.marker_text_edits[i].setPlainText(snap["text"])
+        self._refresh_marker_graphics()
+
+    def _refresh_marker_graphics(self) -> None:
+        if not self.plot_items:
+            return
+
+        for slot in range(3):
+            snap = self.marker_snapshots[slot]
+            lines = self.marker_slot_lines[slot] if slot < len(self.marker_slot_lines) else []
+            if snap is None or "x" not in snap:
+                for line in lines:
+                    line.hide()
+                continue
+            x = float(snap["x"])
+            for line in lines:
+                line.setPos(x)
+                line.show()
+
+        if not self.plot_items:
+            return
+        bottom_plot = self.plot_items[-1]
+        try:
+            y_min, y_max = bottom_plot.viewRange()[1]
+            if not np.isfinite(y_min) or not np.isfinite(y_max) or y_min == y_max:
+                y_min, y_max = -1.0, 1.0
+            x_min, x_max = bottom_plot.viewRange()[0]
+            x_span = max(1e-9, float(x_max - x_min))
+            y_span = max(1e-9, float(y_max - y_min))
+        except Exception:
+            return
+
+        y_base = y_min + y_span * 0.02
+        x_offset = x_span * 0.018
+        spots_x = []
+        self.marker_delete_targets = []
+        for slot, snap in enumerate(self.marker_snapshots):
+            label_item = self.marker_bottom_label_items[slot] if slot < len(self.marker_bottom_label_items) else None
+            if snap is None or "x" not in snap:
+                if label_item is not None:
+                    label_item.hide()
+                continue
+            x = float(snap["x"])
+            if label_item is not None:
+                label_item.setText(f"标记点{slot + 1}", color=self.marker_colors[slot])
+                label_item.setPos(x, y_base)
+                label_item.show()
+
+            x_delete = x + x_offset
+            spots_x.append(
+                {
+                    "pos": (x_delete, y_base),
+                    "pen": pg.mkPen(210, 50, 50, width=1.8),
+                    "data": slot,
+                }
+            )
+            self.marker_delete_targets.append((slot, x_delete, y_base, x_span * 0.01, y_span * 0.08))
+        if self.marker_bottom_xs is not None:
+            self.marker_bottom_xs.setData(spots_x)
+
+    def _on_bottom_marker_x_clicked(self, _plot, points) -> None:
+        if not points:
+            return
+        try:
+            slot = int(points[0].data())
+        except Exception:
+            return
+        self._clear_marker(slot)
+
+    def _try_delete_marker_from_scene_click(self, scene_pos) -> bool:
+        if not self.plot_items:
+            return False
+        bottom_plot = self.plot_items[-1]
+        if not bottom_plot.sceneBoundingRect().contains(scene_pos):
+            return False
+        try:
+            pt = bottom_plot.vb.mapSceneToView(scene_pos)
+            xv = float(pt.x())
+            yv = float(pt.y())
+        except Exception:
+            return False
+
+        for slot, x0, y0, tx, ty in self.marker_delete_targets:
+            if abs(xv - x0) <= tx and abs(yv - y0) <= ty:
+                self._clear_marker(slot)
+                return True
+        return False
+
+    def _clear_marker(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self.marker_snapshots):
+            return
+        self.marker_snapshots[idx] = None
+        self._refresh_marker_views()
+        self.statusBar().showMessage(f"已清除标记点{idx + 1}")
+
+    def _clear_all_markers(self, silent: bool = False) -> None:
+        self.marker_snapshots = [None, None, None]
+        self.marker_next_slot = 0
+        self._refresh_marker_views()
+        if not silent:
+            self.statusBar().showMessage("已清空全部标记")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -960,12 +1453,15 @@ def main() -> int:
     args = parser.parse_args()
 
     app = QtWidgets.QApplication(sys.argv)
+    log_path = setup_runtime_diagnostics()
+    install_exception_hooks()
     set_chinese_font(app)
     configure_style()
 
     init_df = pd.DataFrame({"示例信号": [0.0, 1.0, 0.0]})
     viewer = CsvWaveViewer(init_df, None)
     viewer.show()
+    viewer.statusBar().showMessage(f"就绪 | 诊断日志: {log_path}")
 
     if args.csv is None:
         QtCore.QTimer.singleShot(0, viewer._open_csv_dialog)

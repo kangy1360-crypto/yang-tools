@@ -664,7 +664,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._update_all_y_ranges()
 
     def _mouse_moved(self, evt) -> None:
-        if not self.plot_items or self.value_text is None:
+        if not self.plot_items:
             return
 
         pos = evt[0]

@@ -1,4 +1,5 @@
 ﻿import argparse
+import json
 import os
 import sys
 from typing import List, Optional, Tuple
@@ -249,15 +250,22 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.left_panel = QtWidgets.QFrame()
         self.plot_widget = self._build_plot_area()
         self.value_panel = self._build_value_panel()
+        self.plot_value_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.plot_value_splitter.addWidget(self.plot_widget)
+        self.plot_value_splitter.addWidget(self.value_panel)
+        self.plot_value_splitter.setChildrenCollapsible(False)
+        self.plot_value_splitter.setHandleWidth(6)
+        self.plot_value_splitter.setStretchFactor(0, 1)
+        self.plot_value_splitter.setStretchFactor(1, 0)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(central)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
         layout.addWidget(self.left_panel, 0)
-        layout.addWidget(self.plot_widget, 1)
-        layout.addWidget(self.value_panel, 0)
+        layout.addWidget(self.plot_value_splitter, 1)
         self.setCentralWidget(central)
+        self.plot_value_splitter.setSizes([1200, 320])
 
         self.plot_items = []
         self.plot_cols: List[str] = []
@@ -265,6 +273,10 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.vlines = []
         self.hover_proxy = None
         self.selected_cols: List[str] = []
+        self._syncing_from_region = False
+        self._syncing_from_plot = False
+        self.favorites_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "favorites.json")
+        self.favorites = self._read_favorites()
 
         self.load_thread = None
         self.load_worker = None
@@ -337,12 +349,33 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         btn_row.addWidget(self.btn_none)
         vbox.addLayout(btn_row)
 
+        fav_title = QtWidgets.QLabel("收藏")
+        fav_title.setStyleSheet("font-weight: bold;")
+        vbox.addWidget(fav_title)
+
+        self.fav_combo = QtWidgets.QComboBox()
+        self._refresh_favorites_combo()
+        vbox.addWidget(self.fav_combo)
+
+        fav_btn_row1 = QtWidgets.QHBoxLayout()
+        self.btn_fav_save = QtWidgets.QPushButton("收藏当前")
+        self.btn_fav_apply = QtWidgets.QPushButton("应用收藏")
+        fav_btn_row1.addWidget(self.btn_fav_save)
+        fav_btn_row1.addWidget(self.btn_fav_apply)
+        vbox.addLayout(fav_btn_row1)
+
+        fav_btn_row2 = QtWidgets.QHBoxLayout()
+        self.btn_fav_delete = QtWidgets.QPushButton("删除收藏")
+        fav_btn_row2.addWidget(self.btn_fav_delete)
+        vbox.addLayout(fav_btn_row2)
+
         tips = QtWidgets.QLabel(
             "使用说明:\n"
             "1) 在左侧搜索并勾选信号（默认不勾选）\n"
             "2) 勾选一个就会在右侧新增一个波形\n"
             "3) 底部总览图拖拽灰色区域选择时间段\n"
-            "4) 鼠标移动到任意子图，右侧显示当前时刻各信号值"
+            "4) 鼠标移动到任意子图，右侧显示当前时刻各信号值\n"
+            "5) 可将当前勾选信号保存为收藏并一键恢复"
         )
         tips.setWordWrap(True)
         tips.setStyleSheet("color: #555;")
@@ -357,7 +390,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         panel = QtWidgets.QFrame()
         panel.setFrameShape(QtWidgets.QFrame.StyledPanel)
         panel.setMinimumWidth(250)
-        panel.setMaximumWidth(360)
+        panel.setMaximumWidth(1200)
 
         vbox = QtWidgets.QVBoxLayout(panel)
         vbox.setContentsMargins(10, 10, 10, 10)
@@ -385,6 +418,9 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.btn_all.clicked.connect(self._select_all)
         self.btn_none.clicked.connect(self._select_none)
         self.search_edit.textChanged.connect(self._filter_signals)
+        self.btn_fav_save.clicked.connect(self._save_current_favorite)
+        self.btn_fav_apply.clicked.connect(self._apply_selected_favorite)
+        self.btn_fav_delete.clicked.connect(self._delete_selected_favorite)
 
     def _set_data(self, df: pd.DataFrame, time_col: Optional[str]) -> None:
         self.df = df
@@ -511,6 +547,124 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 selected += 1
         self.selected_count_label.setText(f"已选 {selected} / {self.signal_list.count()}")
 
+    def _refresh_favorites_combo(self) -> None:
+        if not hasattr(self, "fav_combo") or self.fav_combo is None:
+            return
+        current = self.fav_combo.currentText().strip()
+        self.fav_combo.clear()
+        self.fav_combo.addItem("（请选择收藏）")
+        for name in sorted(self.favorites.keys()):
+            self.fav_combo.addItem(name)
+        if current and current in self.favorites:
+            self.fav_combo.setCurrentText(current)
+
+    def _read_favorites(self) -> dict:
+        if not os.path.exists(self.favorites_path):
+            return {}
+        try:
+            with open(self.favorites_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            cleaned = {}
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, list):
+                    cleaned[k] = [str(x) for x in v]
+            return cleaned
+        except Exception:
+            return {}
+
+    def _write_favorites(self) -> None:
+        with open(self.favorites_path, "w", encoding="utf-8") as f:
+            json.dump(self.favorites, f, ensure_ascii=False, indent=2)
+
+    def _save_current_favorite(self) -> None:
+        cols = self._get_checked_columns()
+        if not cols:
+            QtWidgets.QMessageBox.information(self, "提示", "请先勾选至少一个信号再收藏。")
+            return
+
+        default_name = self.fav_combo.currentText().strip()
+        if default_name in ("", "（请选择收藏）"):
+            default_name = "我的收藏"
+
+        name, ok = QtWidgets.QInputDialog.getText(self, "收藏当前选择", "请输入收藏名称：", text=default_name)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QtWidgets.QMessageBox.information(self, "提示", "收藏名称不能为空。")
+            return
+
+        if name in self.favorites:
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "覆盖确认",
+                f"收藏“{name}”已存在，是否覆盖？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+
+        self.favorites[name] = cols
+        self._write_favorites()
+        self._refresh_favorites_combo()
+        self.fav_combo.setCurrentText(name)
+        self.statusBar().showMessage(f"已保存收藏: {name}（{len(cols)}个信号）")
+
+    def _apply_selected_favorite(self) -> None:
+        name = self.fav_combo.currentText().strip()
+        if not name or name == "（请选择收藏）":
+            QtWidgets.QMessageBox.information(self, "提示", "请先选择一个收藏。")
+            return
+        if name not in self.favorites:
+            QtWidgets.QMessageBox.information(self, "提示", f"未找到收藏: {name}")
+            return
+
+        targets = set(self.favorites[name])
+        self.signal_list.blockSignals(True)
+        missing = 0
+        matched = 0
+        existing = {self.signal_list.item(i).text() for i in range(self.signal_list.count())}
+        for t in targets:
+            if t not in existing:
+                missing += 1
+
+        for i in range(self.signal_list.count()):
+            item = self.signal_list.item(i)
+            item.setCheckState(QtCore.Qt.Checked if item.text() in targets else QtCore.Qt.Unchecked)
+            if item.text() in targets:
+                matched += 1
+        self.signal_list.blockSignals(False)
+
+        self._update_selected_count()
+        self._init_plots()
+        self.statusBar().showMessage(f"已应用收藏: {name}（匹配{matched}，缺失{missing}）")
+
+    def _delete_selected_favorite(self) -> None:
+        name = self.fav_combo.currentText().strip()
+        if not name or name == "（请选择收藏）":
+            QtWidgets.QMessageBox.information(self, "提示", "请先选择要删除的收藏。")
+            return
+        if name not in self.favorites:
+            QtWidgets.QMessageBox.information(self, "提示", f"未找到收藏: {name}")
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "删除确认",
+            f"确定删除收藏“{name}”吗？",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        del self.favorites[name]
+        self._write_favorites()
+        self._refresh_favorites_combo()
+        self.statusBar().showMessage(f"已删除收藏: {name}")
+
     def _init_plots(self) -> None:
         self.plot_widget.clear()
         self.plot_items.clear()
@@ -598,6 +752,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self.hover_proxy = pg.SignalProxy(self.plot_items[0].scene().sigMouseMoved, rateLimit=60, slot=self._mouse_moved)
+        for p in self.plot_items:
+            p.vb.sigXRangeChanged.connect(self._on_main_xrange_changed)
         self._update_all_y_ranges()
 
     def _update_all_y_ranges(self) -> None:
@@ -617,19 +773,29 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             seg = seg[np.isfinite(seg)]
             if seg.size == 0:
                 continue
-            if seg.size >= 30:
-                lo, hi = np.nanpercentile(seg, [1, 99])
-            else:
-                lo, hi = float(np.nanmin(seg)), float(np.nanmax(seg))
-
-            if not np.isfinite(lo) or not np.isfinite(hi):
+            peak = float(np.nanmax(np.abs(seg)))
+            if not np.isfinite(peak):
                 continue
-            if lo == hi:
-                pad = max(1.0, abs(lo) * 0.1)
-                p.setYRange(lo - pad, hi + pad, padding=0)
-            else:
-                pad = (hi - lo) * 0.08
-                p.setYRange(lo - pad, hi + pad, padding=0)
+            y_max = self._nice_ceil(peak * 1.3)
+            y_min = -y_max
+            p.setYRange(y_min, y_max, padding=0)
+
+    @staticmethod
+    def _nice_ceil(value: float) -> float:
+        if not np.isfinite(value) or value <= 0:
+            return 1.0
+        exp = np.floor(np.log10(value))
+        base = 10 ** exp
+        ratio = value / base
+        if ratio <= 1:
+            nice = 1
+        elif ratio <= 2:
+            nice = 2
+        elif ratio <= 5:
+            nice = 5
+        else:
+            nice = 10
+        return float(nice * base)
 
     def _select_all(self) -> None:
         self.signal_list.blockSignals(True)
@@ -659,9 +825,62 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         if not self.plot_items:
             return
         left, right = self.region.getRegion()
-        for p in self.plot_items:
-            p.setXRange(left, right, padding=0)
+        if not self._syncing_from_plot:
+            self._syncing_from_region = True
+            try:
+                for p in self.plot_items:
+                    p.setXRange(left, right, padding=0)
+            finally:
+                self._syncing_from_region = False
         self._update_all_y_ranges()
+
+    def _on_main_xrange_changed(self, _vb, ranges) -> None:
+        if not self.plot_items or not hasattr(self, "region") or self._syncing_from_region:
+            return
+
+        xr = self._extract_xrange(ranges, _vb)
+        if xr is None:
+            return
+
+        left, right = xr
+        if left > right:
+            left, right = right, left
+
+        x_min = float(np.nanmin(self.x_display))
+        x_max = float(np.nanmax(self.x_display))
+        left = max(x_min, min(left, x_max))
+        right = max(x_min, min(right, x_max))
+
+        self._syncing_from_plot = True
+        try:
+            cur_left, cur_right = self.region.getRegion()
+            if abs(cur_left - left) > 1e-9 or abs(cur_right - right) > 1e-9:
+                self.region.setRegion((left, right))
+        finally:
+            self._syncing_from_plot = False
+
+    @staticmethod
+    def _extract_xrange(ranges, vb) -> Optional[Tuple[float, float]]:
+        try:
+            # pyqtgraph may send [xmin, xmax]
+            if isinstance(ranges, (list, tuple)) and len(ranges) == 2 and all(
+                isinstance(v, (int, float, np.floating)) for v in ranges
+            ):
+                return float(ranges[0]), float(ranges[1])
+
+            # or [[xmin, xmax], [ymin, ymax]]
+            if isinstance(ranges, (list, tuple)) and len(ranges) >= 1:
+                xr = ranges[0]
+                if isinstance(xr, (list, tuple)) and len(xr) >= 2:
+                    return float(xr[0]), float(xr[1])
+        except Exception:
+            pass
+
+        try:
+            xr = vb.viewRange()[0]
+            return float(xr[0]), float(xr[1])
+        except Exception:
+            return None
 
     def _mouse_moved(self, evt) -> None:
         if not self.plot_items:
@@ -758,3 +977,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

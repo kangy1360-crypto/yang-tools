@@ -1007,20 +1007,22 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         overview_row = len(checked_cols)
         axis_items = self._make_axis_items()
         if axis_items is None:
-            self.overview_plot = self.plot_widget.addPlot(row=overview_row, col=0, title="时间段选择")
+            self.overview_plot = self.plot_widget.addPlot(row=overview_row, col=0, title="")
         else:
             self.overview_plot = self.plot_widget.addPlot(
-                row=overview_row, col=0, title="时间段选择", axisItems=axis_items
+                row=overview_row, col=0, title="", axisItems=axis_items
             )
 
-        self.overview_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.overview_plot.setMaximumHeight(180)
+        # 底部改成“时间进度条”样式：无波形、无Y轴，仅保留时间轴+可拖拽选区
+        self.overview_plot.showGrid(x=False, y=False)
+        self.overview_plot.hideAxis("left")
+        self.overview_plot.setLabel("bottom", "时间进度")
+        self.overview_plot.setMinimumHeight(46)
+        self.overview_plot.setMaximumHeight(58)
+        self.overview_plot.disableAutoRange(axis=pg.ViewBox.YAxis)
         self.overview_plot.disableAutoRange(axis=pg.ViewBox.XAxis)
         self._localize_plot_context_menu(self.overview_plot)
-
-        first_col = checked_cols[0]
-        y_overview = pd.to_numeric(self.df[first_col], errors="coerce").to_numpy(dtype=np.float64)
-        self.overview_plot.plot(self.x_display, y_overview, pen=pg.mkPen((120, 120, 120), width=1))
+        self.overview_plot.setYRange(0.0, 1.0, padding=0)
 
         # 每个标记点在所有子图保留一条固定竖线
         for p in self.plot_items:

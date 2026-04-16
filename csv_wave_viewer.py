@@ -456,6 +456,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._drag_preview_region = None
         self._drag_threshold_px = 6.0
         self._suppress_next_click = False
+        self._hover_gap_threshold = 0.0
 
         self.load_thread = None
         self.load_worker = None
@@ -726,6 +727,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.df = df
         self.time_col = time_col
         self.x_raw, self.x_display, self.is_time_axis = self._build_x_axis(df, time_col)
+        self._hover_gap_threshold = self._compute_hover_gap_threshold()
 
         self.numeric_cols = [
             c for c in df.columns
@@ -1298,10 +1300,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
         point = active_plot.vb.mapSceneToView(pos)
         x_val = float(point.x())
-
-        idx = int(np.searchsorted(self.x_display, x_val))
-        idx = max(0, min(idx, len(self.x_display) - 1))
-        self._update_current_value_panel(idx)
+        self._update_current_value_panel_by_x(x_val)
 
     def _mouse_clicked(self, evt) -> None:
         if not self.plot_items:
@@ -1567,6 +1566,78 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                     sval = str(val)
             lines.append(f"{col}: {sval}")
         return lines
+
+    def _compute_hover_gap_threshold(self) -> float:
+        if self.x_display.size < 2:
+            return 0.0
+        diffs = np.diff(self.x_display.astype(np.float64))
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if diffs.size == 0:
+            return 0.0
+        if diffs.size < 5:
+            return float(max(np.nanmax(diffs) * 2.0, 1e-9))
+        med = float(np.nanmedian(diffs))
+        p95 = float(np.nanpercentile(diffs, 95))
+        return float(max(med * 5.0, p95 * 2.0, 1e-9))
+
+    def _pick_hover_index(self, x_cursor: float) -> Optional[int]:
+        if self.x_display.size == 0 or not np.isfinite(x_cursor):
+            return None
+
+        x = self.x_display
+        n = len(x)
+        threshold = float(self._hover_gap_threshold)
+        idx = int(np.searchsorted(x, x_cursor, side="left"))
+
+        if idx <= 0:
+            if threshold <= 0.0:
+                return 0
+            return 0 if abs(float(x[0]) - x_cursor) <= threshold else None
+        if idx >= n:
+            if threshold <= 0.0:
+                return n - 1
+            return (n - 1) if abs(float(x[-1]) - x_cursor) <= threshold else None
+
+        left_i = idx - 1
+        right_i = idx
+        left_x = float(x[left_i])
+        right_x = float(x[right_i])
+        gap = right_x - left_x
+        if threshold > 0.0 and gap > threshold:
+            return None
+
+        chosen = left_i if abs(x_cursor - left_x) <= abs(right_x - x_cursor) else right_i
+        if threshold > 0.0 and abs(float(x[chosen]) - x_cursor) > threshold:
+            return None
+        return chosen
+
+    def _build_hover_value_lines(self, x_cursor: float, idx: Optional[int]) -> List[str]:
+        lines = []
+        if self.is_time_axis:
+            ts_ms = int(round(x_cursor * 1000.0))
+            t_text = pd.to_datetime(ts_ms, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            lines.append(f"时间: {t_text}")
+        else:
+            lines.append(f"样本位置: {x_cursor:.3f}")
+
+        for col in self.selected_cols:
+            sval = ""
+            if idx is not None:
+                val = self.df[col].iloc[idx]
+                if not pd.isna(val):
+                    try:
+                        sval = f"{float(val):.6g}"
+                    except Exception:
+                        sval = str(val)
+            lines.append(f"{col}: {sval}")
+        return lines
+
+    def _update_current_value_panel_by_x(self, x_cursor: float) -> None:
+        idx = self._pick_hover_index(x_cursor)
+        for line in self.vlines:
+            line.setPos(x_cursor)
+        lines = self._build_hover_value_lines(x_cursor, idx)
+        self.value_display.setPlainText("\n".join(lines))
 
     def _update_current_value_panel(self, idx: int) -> None:
         x_actual = self.x_display[idx]

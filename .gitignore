@@ -8,3 +8,6 @@ _diag_tmp/
 *.tmp
 *.bak
 favorites.json
+build/
+dist/
+*.spec

@@ -447,6 +447,15 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.marker_bottom_xs = None
         self.marker_delete_targets = []
         self._menu_localizing = False
+        self._scene_obj = None
+        self._drag_select_candidate = False
+        self._drag_select_active = False
+        self._drag_start_scene_pos = None
+        self._drag_start_x = None
+        self._drag_active_plot = None
+        self._drag_preview_region = None
+        self._drag_threshold_px = 6.0
+        self._suppress_next_click = False
 
         self.load_thread = None
         self.load_worker = None
@@ -1084,6 +1093,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self.hover_proxy = pg.SignalProxy(self.plot_items[0].scene().sigMouseMoved, rateLimit=60, slot=self._mouse_moved)
+        self._install_scene_event_filter(self.plot_items[0].scene())
         try:
             self.plot_items[0].scene().sigMouseClicked.disconnect(self._mouse_clicked)
         except Exception:
@@ -1296,6 +1306,9 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
     def _mouse_clicked(self, evt) -> None:
         if not self.plot_items:
             return
+        if self._suppress_next_click:
+            self._suppress_next_click = False
+            return
         try:
             if evt.button() != QtCore.Qt.LeftButton:
                 return
@@ -1315,6 +1328,190 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         idx = int(np.searchsorted(self.x_display, float(point.x())))
         idx = max(0, min(idx, len(self.x_display) - 1))
         self._freeze_marker_at_index(idx)
+
+    def _install_scene_event_filter(self, scene_obj) -> None:
+        if scene_obj is None:
+            return
+        if self._scene_obj is scene_obj:
+            return
+        if self._scene_obj is not None:
+            try:
+                self._scene_obj.removeEventFilter(self)
+            except Exception:
+                pass
+        self._scene_obj = scene_obj
+        self._scene_obj.installEventFilter(self)
+
+    def _clear_drag_preview(self) -> None:
+        if self._drag_preview_region is None:
+            return
+        try:
+            if self._drag_active_plot is not None:
+                self._drag_active_plot.removeItem(self._drag_preview_region)
+        except Exception:
+            pass
+        self._drag_preview_region = None
+
+    def _find_active_plot_by_scene_pos(self, scene_pos):
+        for p in self.plot_items:
+            if p.sceneBoundingRect().contains(scene_pos):
+                return p
+        return None
+
+    def eventFilter(self, obj, event):
+        if obj is not self._scene_obj or not self.plot_items:
+            return super().eventFilter(obj, event)
+
+        et = event.type()
+        if et == QtCore.QEvent.GraphicsSceneWheel:
+            if not hasattr(self, "region") or self.overview_plot is None:
+                return super().eventFilter(obj, event)
+            try:
+                pos = event.scenePos()
+            except Exception:
+                return super().eventFilter(obj, event)
+            if not self.overview_plot.sceneBoundingRect().contains(pos):
+                return super().eventFilter(obj, event)
+            if not (hasattr(self, "_x_domain_min") and hasattr(self, "_x_domain_max")):
+                return super().eventFilter(obj, event)
+
+            x_min = float(self._x_domain_min)
+            x_max = float(self._x_domain_max)
+            span = max(1e-12, x_max - x_min)
+            cur_left, cur_right = self.region.getRegion()
+            cur_width = max(1e-12, float(cur_right - cur_left))
+            try:
+                delta = float(event.delta())
+            except Exception:
+                try:
+                    delta = float(event.angleDelta().y())
+                except Exception:
+                    delta = 0.0
+            if abs(delta) < 1e-12:
+                return super().eventFilter(obj, event)
+
+            scale = 1.15 if delta > 0 else (1.0 / 1.15)
+            target_width = cur_width * scale
+            min_width = max(1e-6 * span, 1e-6)
+            target_width = max(min_width, min(target_width, span))
+
+            x_center = float(self.overview_plot.vb.mapSceneToView(pos).x())
+            x_center = max(x_min, min(x_center, x_max))
+            left = x_center - 0.5 * target_width
+            right = x_center + 0.5 * target_width
+            left, right = self._clamp_x_window(left, right, x_min, x_max, prefer_width=target_width)
+            self.region.setRegion((left, right))
+            try:
+                event.accept()
+            except Exception:
+                pass
+            return True
+
+        if et == QtCore.QEvent.GraphicsSceneMousePress:
+            try:
+                if event.button() != QtCore.Qt.LeftButton:
+                    return super().eventFilter(obj, event)
+                pos = event.scenePos()
+            except Exception:
+                return super().eventFilter(obj, event)
+
+            active_plot = self._find_active_plot_by_scene_pos(pos)
+            if active_plot is None:
+                self._drag_select_candidate = False
+                return super().eventFilter(obj, event)
+
+            self._drag_select_candidate = True
+            self._drag_select_active = False
+            self._drag_start_scene_pos = QtCore.QPointF(pos)
+            self._drag_active_plot = active_plot
+            try:
+                self._drag_start_x = float(active_plot.vb.mapSceneToView(pos).x())
+            except Exception:
+                self._drag_start_x = None
+            self._clear_drag_preview()
+            return super().eventFilter(obj, event)
+
+        if et == QtCore.QEvent.GraphicsSceneMouseMove:
+            if not self._drag_select_candidate or self._drag_active_plot is None or self._drag_start_scene_pos is None:
+                return super().eventFilter(obj, event)
+            try:
+                if not (event.buttons() & QtCore.Qt.LeftButton):
+                    return super().eventFilter(obj, event)
+                pos = event.scenePos()
+            except Exception:
+                return super().eventFilter(obj, event)
+
+            dx = abs(float(pos.x()) - float(self._drag_start_scene_pos.x()))
+            if (not self._drag_select_active) and dx >= self._drag_threshold_px:
+                self._drag_select_active = True
+                self._drag_preview_region = pg.LinearRegionItem(
+                    values=[self._drag_start_x, self._drag_start_x],
+                    brush=pg.mkBrush(120, 120, 200, 50),
+                    pen=pg.mkPen((70, 70, 140), width=1),
+                    movable=False,
+                )
+                self._drag_preview_region.setZValue(30)
+                self._drag_active_plot.addItem(self._drag_preview_region)
+
+            if self._drag_select_active and self._drag_preview_region is not None and self._drag_start_x is not None:
+                cur_x = float(self._drag_active_plot.vb.mapSceneToView(pos).x())
+                left, right = (self._drag_start_x, cur_x) if self._drag_start_x <= cur_x else (cur_x, self._drag_start_x)
+                if hasattr(self, "_x_domain_min") and hasattr(self, "_x_domain_max"):
+                    x_min = float(self._x_domain_min)
+                    x_max = float(self._x_domain_max)
+                    left = max(x_min, min(left, x_max))
+                    right = max(x_min, min(right, x_max))
+                self._drag_preview_region.setRegion((left, right))
+                try:
+                    event.accept()
+                except Exception:
+                    pass
+                return True
+            return super().eventFilter(obj, event)
+
+        if et == QtCore.QEvent.GraphicsSceneMouseRelease:
+            if not self._drag_select_candidate:
+                return super().eventFilter(obj, event)
+            try:
+                is_left_release = event.button() == QtCore.Qt.LeftButton
+                pos = event.scenePos()
+            except Exception:
+                is_left_release = False
+                pos = None
+
+            if is_left_release and self._drag_select_active and self._drag_active_plot is not None and pos is not None and self._drag_start_x is not None:
+                cur_x = float(self._drag_active_plot.vb.mapSceneToView(pos).x())
+                left, right = (self._drag_start_x, cur_x) if self._drag_start_x <= cur_x else (cur_x, self._drag_start_x)
+                if hasattr(self, "_x_domain_min") and hasattr(self, "_x_domain_max"):
+                    x_min = float(self._x_domain_min)
+                    x_max = float(self._x_domain_max)
+                    left = max(x_min, min(left, x_max))
+                    right = max(x_min, min(right, x_max))
+                if abs(right - left) > 1e-12 and hasattr(self, "region"):
+                    self.region.setRegion((left, right))
+                    self._suppress_next_click = True
+
+                self._clear_drag_preview()
+                self._drag_select_candidate = False
+                self._drag_select_active = False
+                self._drag_start_scene_pos = None
+                self._drag_start_x = None
+                self._drag_active_plot = None
+                try:
+                    event.accept()
+                except Exception:
+                    pass
+                return True
+
+            self._clear_drag_preview()
+            self._drag_select_candidate = False
+            self._drag_select_active = False
+            self._drag_start_scene_pos = None
+            self._drag_start_x = None
+            self._drag_active_plot = None
+            return super().eventFilter(obj, event)
+
+        return super().eventFilter(obj, event)
 
     def _format_time_text(self, x_actual: float) -> str:
         if self.is_time_axis:

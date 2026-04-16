@@ -11,3 +11,4 @@ favorites.json
 build/
 dist/
 *.spec
+_data_cache/

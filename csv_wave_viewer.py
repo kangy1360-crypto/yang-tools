@@ -1,5 +1,6 @@
 ﻿import argparse
 import faulthandler
+import hashlib
 import json
 import logging
 import os
@@ -312,7 +313,7 @@ def load_csv_with_fallback(path: str) -> pd.DataFrame:
 
 class CsvLoadWorker(QtCore.QObject):
     progress = QtCore.Signal(int, str)
-    finished = QtCore.Signal(object, object, str)
+    finished = QtCore.Signal(object, object, str, str)
     error = QtCore.Signal(str)
     canceled = QtCore.Signal()
 
@@ -324,6 +325,61 @@ class CsvLoadWorker(QtCore.QObject):
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
+
+    def _cache_paths(self) -> Tuple[str, str]:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        cache_dir = os.path.join(base_dir, "_data_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        abs_path = os.path.abspath(self.path)
+        key = hashlib.sha1(abs_path.encode("utf-8", errors="ignore")).hexdigest()
+        return (
+            os.path.join(cache_dir, f"{key}.pkl"),
+            os.path.join(cache_dir, f"{key}.meta.json"),
+        )
+
+    def _load_from_cache_if_valid(self) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        data_path, meta_path = self._cache_paths()
+        if not (os.path.exists(data_path) and os.path.exists(meta_path)):
+            return None, None
+
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            st = os.stat(self.path)
+            if int(meta.get("source_size", -1)) != int(st.st_size):
+                return None, None
+            if int(meta.get("source_mtime_ns", -1)) != int(st.st_mtime_ns):
+                return None, None
+
+            self.progress.emit(8, "命中本地缓存，正在读取...")
+            df = pd.read_pickle(data_path)
+            cached_time_col = meta.get("time_col")
+            if isinstance(cached_time_col, str) and cached_time_col in df.columns:
+                time_col = cached_time_col
+            else:
+                time_col = None
+            return df, time_col
+        except Exception:
+            return None, None
+
+    def _write_cache_best_effort(self, df: pd.DataFrame, time_col: Optional[str]) -> None:
+        try:
+            data_path, meta_path = self._cache_paths()
+            st = os.stat(self.path)
+            df.to_pickle(data_path)
+            meta = {
+                "schema_version": 1,
+                "source_path": os.path.abspath(self.path),
+                "source_size": int(st.st_size),
+                "source_mtime_ns": int(st.st_mtime_ns),
+                "rows": int(len(df)),
+                "cols": int(len(df.columns)),
+                "time_col": time_col if isinstance(time_col, str) else None,
+            }
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _count_lines(self) -> int:
         size = max(1, os.path.getsize(self.path))
@@ -343,6 +399,25 @@ class CsvLoadWorker(QtCore.QObject):
         return max(1, line_count)
 
     def run(self) -> None:
+        self.progress.emit(1, "检查本地缓存...")
+        cached_df, cached_time_col = self._load_from_cache_if_valid()
+        if cached_df is not None:
+            if self._cancel_requested:
+                self.canceled.emit()
+                return
+
+            time_col = self.forced_time_col
+            if time_col is not None and time_col not in cached_df.columns:
+                time_col = None
+            if time_col is None:
+                time_col = cached_time_col
+            if time_col is None:
+                time_col = detect_best_time_column(cached_df)
+
+            self.progress.emit(100, "缓存加载完成")
+            self.finished.emit(cached_df, time_col, os.path.basename(self.path), "cache_hit")
+            return
+
         encodings = ["gbk", "utf-8-sig", "utf-8"]
         errors = []
 
@@ -386,8 +461,10 @@ class CsvLoadWorker(QtCore.QObject):
                 if time_col is None:
                     time_col = detect_best_time_column(df)
 
+                self.progress.emit(96, "写入本地缓存...")
+                self._write_cache_best_effort(df, time_col)
                 self.progress.emit(100, "加载完成")
-                self.finished.emit(df, time_col, os.path.basename(self.path))
+                self.finished.emit(df, time_col, os.path.basename(self.path), "csv_loaded")
                 return
             except Exception as exc:
                 errors.append(f"{enc}: {exc}")
@@ -457,6 +534,14 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._drag_threshold_px = 6.0
         self._suppress_next_click = False
         self._hover_gap_threshold = 0.0
+        self._col_numeric_cache = {}
+        self._col_block_absmax_cache = {}
+        self._absmax_block_size = 512
+        self._large_data_mode = False
+        self._y_range_timer = QtCore.QTimer(self)
+        self._y_range_timer.setSingleShot(True)
+        self._y_range_timer.setInterval(40)
+        self._y_range_timer.timeout.connect(self._update_all_y_ranges)
 
         self.load_thread = None
         self.load_worker = None
@@ -726,6 +811,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
     def _set_data(self, df: pd.DataFrame, time_col: Optional[str]) -> None:
         self.df = df
         self.time_col = time_col
+        self._col_numeric_cache = {}
+        self._col_block_absmax_cache = {}
         self.x_raw, self.x_display, self.is_time_axis = self._build_x_axis(df, time_col)
         self._hover_gap_threshold = self._compute_hover_gap_threshold()
 
@@ -735,6 +822,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         ]
         if not self.numeric_cols:
             raise ValueError("CSV中没有可绘制的数值列。")
+        self._update_performance_mode()
 
         new_left = self._build_left_panel()
         old_left = self.left_panel
@@ -747,6 +835,128 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._update_selected_count()
         self._clear_all_markers(silent=True)
         self._init_plots()
+
+    def _update_performance_mode(self) -> None:
+        rows = int(len(self.df))
+        cols = int(len(self.numeric_cols))
+        est_points = rows * max(1, cols)
+        self._large_data_mode = (rows >= 250_000) or (est_points >= 8_000_000)
+        pg.setConfigOptions(antialias=(not self._large_data_mode))
+
+    def _get_numeric_column_array(self, col: str) -> np.ndarray:
+        cached = self._col_numeric_cache.get(col)
+        if cached is not None:
+            return cached
+        arr = pd.to_numeric(self.df[col], errors="coerce").to_numpy(dtype=np.float64)
+        self._col_numeric_cache[col] = arr
+        return arr
+
+    def _get_absmax_blocks(self, col: str) -> np.ndarray:
+        cached = self._col_block_absmax_cache.get(col)
+        if cached is not None:
+            return cached
+
+        y = self._get_numeric_column_array(col)
+        n = len(y)
+        bs = int(self._absmax_block_size)
+        if n <= 0 or bs <= 0:
+            out = np.array([], dtype=np.float64)
+            self._col_block_absmax_cache[col] = out
+            return out
+
+        n_blocks = int(np.ceil(float(n) / float(bs)))
+        out = np.full(n_blocks, np.nan, dtype=np.float64)
+        for bi in range(n_blocks):
+            s = bi * bs
+            e = min(n, s + bs)
+            seg = y[s:e]
+            seg = seg[np.isfinite(seg)]
+            if seg.size > 0:
+                out[bi] = float(np.nanmax(np.abs(seg)))
+        self._col_block_absmax_cache[col] = out
+        return out
+
+    def _query_absmax_in_range(self, col: str, i0: int, i1: int) -> float:
+        y = self._get_numeric_column_array(col)
+        n = len(y)
+        if n <= 0:
+            return np.nan
+        i0 = max(0, min(int(i0), n - 1))
+        i1 = max(i0 + 1, min(int(i1), n))
+        if i1 - i0 <= 4096:
+            seg = y[i0:i1]
+            seg = seg[np.isfinite(seg)]
+            if seg.size == 0:
+                return np.nan
+            return float(np.nanmax(np.abs(seg)))
+
+        bs = int(self._absmax_block_size)
+        blocks = self._get_absmax_blocks(col)
+        if blocks.size == 0:
+            return np.nan
+
+        first_full = (i0 + bs - 1) // bs
+        last_full = i1 // bs
+        best = np.nan
+
+        left_edge_end = min(i1, first_full * bs)
+        if left_edge_end > i0:
+            seg = y[i0:left_edge_end]
+            seg = seg[np.isfinite(seg)]
+            if seg.size > 0:
+                best = float(np.nanmax(np.abs(seg)))
+
+        right_edge_start = max(i0, last_full * bs)
+        if i1 > right_edge_start:
+            seg = y[right_edge_start:i1]
+            seg = seg[np.isfinite(seg)]
+            if seg.size > 0:
+                cur = float(np.nanmax(np.abs(seg)))
+                best = cur if not np.isfinite(best) else max(best, cur)
+
+        if first_full < last_full:
+            mid = blocks[first_full:last_full]
+            mid = mid[np.isfinite(mid)]
+            if mid.size > 0:
+                cur = float(np.nanmax(mid))
+                best = cur if not np.isfinite(best) else max(best, cur)
+        return best
+
+    def _schedule_y_range_update(self) -> None:
+        if self._y_range_timer.isActive():
+            self._y_range_timer.start()
+            return
+        self._y_range_timer.start()
+
+    def _update_curve_downsampling(self) -> None:
+        if not self.plot_items or not self.curves:
+            return
+
+        for p, col in zip(self.plot_items, self.plot_cols):
+            curve = self.curves.get(col)
+            if curve is None:
+                continue
+            try:
+                x_left, x_right = p.vb.viewRange()[0]
+            except Exception:
+                x_left, x_right = float(self.x_display[0]), float(self.x_display[-1])
+            if x_left > x_right:
+                x_left, x_right = x_right, x_left
+
+            i0 = int(np.searchsorted(self.x_display, x_left, side="left"))
+            i1 = int(np.searchsorted(self.x_display, x_right, side="right"))
+            i0 = max(0, min(i0, len(self.x_display) - 1))
+            i1 = max(i0 + 1, min(i1, len(self.x_display)))
+            visible_count = max(1, i1 - i0)
+
+            view_px = max(220, int(p.vb.width()))
+            target_points = max(1200, view_px * (2 if self._large_data_mode else 3))
+            ds = max(1, int(np.ceil(float(visible_count) / float(target_points))))
+            try:
+                curve.setDownsampling(ds=ds, auto=False, method="peak")
+                curve.setClipToView(True)
+            except Exception:
+                pass
 
     def _open_csv_dialog(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -798,7 +1008,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             self.progress_dialog.setValue(max(0, min(100, percent)))
         self.statusBar().showMessage(text)
 
-    def _on_load_finished(self, df: pd.DataFrame, time_col: Optional[str], file_name: str) -> None:
+    def _on_load_finished(self, df: pd.DataFrame, time_col: Optional[str], file_name: str, load_source: str = "csv_loaded") -> None:
         if self.progress_dialog is not None:
             self.progress_dialog.setValue(100)
             self.progress_dialog.close()
@@ -806,10 +1016,11 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         try:
             self._set_data(df, time_col)
             self.setWindowTitle(f"CSV多信号波形查看器 - {file_name}")
+            source_hint = "（缓存）" if load_source == "cache_hit" else ""
             if time_col is None:
-                self.statusBar().showMessage(f"加载完成: {file_name}（未识别到时间列，当前为样本轴）")
+                self.statusBar().showMessage(f"加载完成{source_hint}: {file_name}（未识别到时间列，当前为样本轴）")
             else:
-                self.statusBar().showMessage(f"加载完成: {file_name}（时间列: {time_col}）")
+                self.statusBar().showMessage(f"加载完成{source_hint}: {file_name}（时间列: {time_col}）")
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "加载失败", str(exc))
 
@@ -998,13 +1209,11 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             p.showGrid(x=True, y=True, alpha=0.25)
             p.setLabel("left", str(col))
 
-            y = pd.to_numeric(self.df[col], errors="coerce").to_numpy(dtype=np.float64)
+            y = self._get_numeric_column_array(col)
             curve = p.plot(
                 self.x_display,
                 y,
                 pen=pg.mkPen(color=pg.intColor(i, hues=max(8, len(checked_cols))), width=2),
-                autoDownsample=True,
-                downsampleMethod="peak",
                 clipToView=True,
             )
             self.curves[col] = curve
@@ -1103,6 +1312,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.plot_items[0].scene().sigMouseClicked.connect(self._mouse_clicked)
         for p in self.plot_items:
             p.vb.sigXRangeChanged.connect(self._on_main_xrange_changed)
+        self._update_curve_downsampling()
         self._update_all_y_ranges()
 
     def _update_all_y_ranges(self) -> None:
@@ -1117,12 +1327,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         i1 = max(i0 + 1, min(i1, len(self.x_display)))
 
         for p, col in zip(self.plot_items, self.plot_cols):
-            y = pd.to_numeric(self.df[col], errors="coerce").to_numpy(dtype=np.float64)
-            seg = y[i0:i1]
-            seg = seg[np.isfinite(seg)]
-            if seg.size == 0:
-                continue
-            peak = float(np.nanmax(np.abs(seg)))
+            peak = self._query_absmax_in_range(col, i0, i1)
             if not np.isfinite(peak):
                 continue
             y_max = self._nice_ceil(peak * 1.3)
@@ -1224,8 +1429,9 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                     p.setXRange(left, right, padding=0)
             finally:
                 self._syncing_from_region = False
+        self._update_curve_downsampling()
         self._refresh_marker_graphics()
-        self._update_all_y_ranges()
+        self._schedule_y_range_update()
 
     def _on_main_xrange_changed(self, _vb, ranges) -> None:
         if not self.plot_items or not hasattr(self, "region") or self._syncing_from_region:
@@ -1261,6 +1467,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 self._syncing_from_region = False
         finally:
             self._syncing_from_plot = False
+        self._update_curve_downsampling()
+        self._schedule_y_range_update()
 
     @staticmethod
     def _extract_xrange(ranges, vb) -> Optional[Tuple[float, float]]:
@@ -1556,7 +1764,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             lines.append(f"样本: {idx}")
 
         for col in self.selected_cols:
-            val = self.df[col].iloc[idx]
+            arr = self._get_numeric_column_array(col)
+            val = arr[idx] if 0 <= idx < len(arr) else np.nan
             if pd.isna(val):
                 sval = "NaN"
             else:
@@ -1623,7 +1832,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         for col in self.selected_cols:
             sval = ""
             if idx is not None:
-                val = self.df[col].iloc[idx]
+                arr = self._get_numeric_column_array(col)
+                val = arr[idx] if 0 <= idx < len(arr) else np.nan
                 if not pd.isna(val):
                     try:
                         sval = f"{float(val):.6g}"

@@ -591,12 +591,6 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             gv.setContentsMargins(8, 8, 8, 8)
             gv.setSpacing(4)
 
-            if i == 0:
-                hint = QtWidgets.QLabel("左键点击任意波形可冻结；在图中“标记点N ×”处删除。")
-                hint.setStyleSheet("color: #666;")
-                hint.setWordWrap(True)
-                gv.addWidget(hint)
-
             tlabel = QtWidgets.QLabel("未标记")
             tlabel.setStyleSheet("color: #555;")
             gv.addWidget(tlabel)

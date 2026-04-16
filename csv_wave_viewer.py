@@ -1370,7 +1370,11 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 pos = event.scenePos()
             except Exception:
                 return super().eventFilter(obj, event)
-            if not self.overview_plot.sceneBoundingRect().contains(pos):
+            active_plot = self._find_active_plot_by_scene_pos(pos)
+            use_plot = active_plot
+            if use_plot is None and self.overview_plot.sceneBoundingRect().contains(pos):
+                use_plot = self.overview_plot
+            if use_plot is None:
                 return super().eventFilter(obj, event)
             if not (hasattr(self, "_x_domain_min") and hasattr(self, "_x_domain_max")):
                 return super().eventFilter(obj, event)
@@ -1380,6 +1384,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             span = max(1e-12, x_max - x_min)
             cur_left, cur_right = self.region.getRegion()
             cur_width = max(1e-12, float(cur_right - cur_left))
+            old_center = 0.5 * (cur_left + cur_right)
             try:
                 delta = float(event.delta())
             except Exception:
@@ -1395,11 +1400,33 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             min_width = max(1e-6 * span, 1e-6)
             target_width = max(min_width, min(target_width, span))
 
-            x_center = float(self.overview_plot.vb.mapSceneToView(pos).x())
-            x_center = max(x_min, min(x_center, x_max))
-            left = x_center - 0.5 * target_width
-            right = x_center + 0.5 * target_width
+            # 以鼠标所在时间点为锚点做缩放，保证“指哪缩哪”
+            x_anchor = float(use_plot.vb.mapSceneToView(pos).x())
+            x_anchor = max(x_min, min(x_anchor, x_max))
+            if cur_width <= 1e-12:
+                ratio = 0.5
+            else:
+                ratio = (x_anchor - cur_left) / cur_width
+                ratio = max(0.0, min(1.0, ratio))
+
+            left = x_anchor - ratio * target_width
+            right = left + target_width
+            if left < x_min:
+                shift = x_min - left
+                left += shift
+                right += shift
+            if right > x_max:
+                shift = right - x_max
+                left -= shift
+                right -= shift
             left, right = self._clamp_x_window(left, right, x_min, x_max, prefer_width=target_width)
+            new_center = 0.5 * (left + right)
+            if abs(new_center - old_center) < 1e-12 and abs(target_width - cur_width) < 1e-12:
+                try:
+                    event.accept()
+                except Exception:
+                    pass
+                return True
             self.region.setRegion((left, right))
             try:
                 event.accept()

@@ -1154,6 +1154,40 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 cols.append(item.text())
         return cols
 
+    @staticmethod
+    def _clamp_x_window(
+        left: float,
+        right: float,
+        x_min: float,
+        x_max: float,
+        prefer_width: Optional[float] = None,
+    ) -> Tuple[float, float]:
+        if left > right:
+            left, right = right, left
+
+        span = max(0.0, float(x_max) - float(x_min))
+        width = float(right - left)
+        if prefer_width is not None and np.isfinite(prefer_width):
+            width = float(prefer_width)
+        width = max(0.0, min(width, span))
+
+        center = 0.5 * (left + right)
+        new_left = center - 0.5 * width
+        new_right = center + 0.5 * width
+
+        if new_left < x_min:
+            shift = x_min - new_left
+            new_left += shift
+            new_right += shift
+        if new_right > x_max:
+            shift = new_right - x_max
+            new_left -= shift
+            new_right -= shift
+
+        new_left = max(x_min, min(new_left, x_max))
+        new_right = max(new_left, min(new_right, x_max))
+        return new_left, new_right
+
     def _on_region_changed(self) -> None:
         if not self.plot_items:
             return
@@ -1161,10 +1195,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         if hasattr(self, "_x_domain_min") and hasattr(self, "_x_domain_max"):
             x_min = float(self._x_domain_min)
             x_max = float(self._x_domain_max)
-            left = max(x_min, min(left, x_max))
-            right = max(x_min, min(right, x_max))
-            if left > right:
-                left, right = right, left
+            left, right = self._clamp_x_window(left, right, x_min, x_max, prefer_width=(right - left))
             cur_left, cur_right = self.region.getRegion()
             if abs(cur_left - left) > 1e-9 or abs(cur_right - right) > 1e-9:
                 self.region.blockSignals(True)
@@ -1198,14 +1229,20 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         else:
             x_min = float(np.nanmin(self.x_display))
             x_max = float(np.nanmax(self.x_display))
-        left = max(x_min, min(left, x_max))
-        right = max(x_min, min(right, x_max))
+        cur_left, cur_right = self.region.getRegion()
+        prefer_width = max(0.0, float(cur_right - cur_left))
+        left, right = self._clamp_x_window(left, right, x_min, x_max, prefer_width=prefer_width)
 
         self._syncing_from_plot = True
         try:
-            cur_left, cur_right = self.region.getRegion()
             if abs(cur_left - left) > 1e-9 or abs(cur_right - right) > 1e-9:
                 self.region.setRegion((left, right))
+            self._syncing_from_region = True
+            try:
+                for p in self.plot_items:
+                    p.setXRange(left, right, padding=0)
+            finally:
+                self._syncing_from_region = False
         finally:
             self._syncing_from_plot = False
 

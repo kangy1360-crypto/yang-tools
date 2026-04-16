@@ -996,7 +996,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             # 上方所有子图统一隐藏X轴刻度与标题，只在底部总览显示时间轴
             p.hideAxis("bottom")
 
-            vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((255, 80, 80), width=1))
+            vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((255, 80, 80, 220), width=2.4))
             p.addItem(vline, ignoreBounds=True)
             self.vlines.append(vline)
             self.plot_items.append(p)

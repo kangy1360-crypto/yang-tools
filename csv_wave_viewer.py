@@ -535,6 +535,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._drag_threshold_px = 6.0
         self._suppress_next_click = False
         self._hover_gap_threshold = 0.0
+        self._hover_snap_threshold = 0.0
+        self._hover_gap_limit = 0.0
         self._col_numeric_cache = {}
         self._col_block_absmax_cache = {}
         self._absmax_block_size = 512
@@ -818,7 +820,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._col_block_absmax_cache = {}
         self._curve_marker_visible = {}
         self.x_raw, self.x_display, self.is_time_axis = self._build_x_axis(df, time_col)
-        self._hover_gap_threshold = self._compute_hover_gap_threshold()
+        self._recompute_hover_rules()
 
         self.numeric_cols = [
             c for c in df.columns
@@ -980,6 +982,15 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 except Exception:
                     pass
                 self._curve_marker_visible[col] = want_marker
+            if want_marker:
+                if visible_count <= 200:
+                    marker_size = 5
+                else:
+                    marker_size = 3
+                try:
+                    curve.setSymbolSize(marker_size)
+                except Exception:
+                    pass
 
     def _open_csv_dialog(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1843,22 +1854,54 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         p95 = float(np.nanpercentile(diffs, 95))
         return float(max(med * 5.0, p95 * 2.0, 1e-9))
 
+    def _recompute_hover_rules(self) -> None:
+        self._hover_gap_threshold = 0.0
+        self._hover_snap_threshold = 0.0
+        self._hover_gap_limit = 0.0
+        if self.x_display.size < 2:
+            return
+
+        diffs = np.diff(self.x_display.astype(np.float64))
+        diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+        if diffs.size == 0:
+            return
+
+        dt_min = float(np.nanmin(diffs))
+        dt_median = float(np.nanmedian(diffs))
+        # 吸附阈值：按最小步长*2，并加上下限/上限保护，避免异常数据导致阈值失真
+        snap = 2.0 * dt_min
+        snap = max(snap, 1e-3)
+        snap = min(snap, 2.0 if self.is_time_axis else max(2.0, 2.0 * dt_median))
+
+        # 断档阈值：超过该阈值的区间视为“空档”，禁止吸附
+        gap_limit = max(5.0 * dt_median, 60.0 if self.is_time_axis else 2.0)
+
+        self._hover_snap_threshold = float(snap)
+        self._hover_gap_limit = float(gap_limit)
+        # 兼容旧变量名
+        self._hover_gap_threshold = self._hover_snap_threshold
+
     def _pick_hover_index(self, x_cursor: float) -> Optional[int]:
         if self.x_display.size == 0 or not np.isfinite(x_cursor):
             return None
 
         x = self.x_display
         n = len(x)
-        threshold = float(self._hover_gap_threshold)
+        threshold = float(self._hover_snap_threshold)
+        gap_limit = float(self._hover_gap_limit)
         idx = int(np.searchsorted(x, x_cursor, side="left"))
 
         if idx <= 0:
             if threshold <= 0.0:
                 return 0
+            if n >= 2 and gap_limit > 0.0 and abs(float(x[1]) - float(x[0])) > gap_limit:
+                return None
             return 0 if abs(float(x[0]) - x_cursor) <= threshold else None
         if idx >= n:
             if threshold <= 0.0:
                 return n - 1
+            if n >= 2 and gap_limit > 0.0 and abs(float(x[-1]) - float(x[-2])) > gap_limit:
+                return None
             return (n - 1) if abs(float(x[-1]) - x_cursor) <= threshold else None
 
         left_i = idx - 1
@@ -1866,7 +1909,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         left_x = float(x[left_i])
         right_x = float(x[right_i])
         gap = right_x - left_x
-        if threshold > 0.0 and gap > threshold:
+        if gap_limit > 0.0 and gap > gap_limit:
             return None
 
         chosen = left_i if abs(x_cursor - left_x) <= abs(right_x - x_cursor) else right_i
@@ -1898,9 +1941,10 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
     def _update_current_value_panel_by_x(self, x_cursor: float) -> None:
         idx = self._pick_hover_index(x_cursor)
+        shown_x = float(self.x_display[idx]) if idx is not None else x_cursor
         for line in self.vlines:
-            line.setPos(x_cursor)
-        lines = self._build_hover_value_lines(x_cursor, idx)
+            line.setPos(shown_x)
+        lines = self._build_hover_value_lines(shown_x, idx)
         self.value_display.setPlainText("\n".join(lines))
 
     def _update_current_value_panel(self, idx: int) -> None:

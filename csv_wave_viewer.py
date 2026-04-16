@@ -539,6 +539,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._col_block_absmax_cache = {}
         self._absmax_block_size = 512
         self._large_data_mode = False
+        self._marker_auto_threshold = 3000
+        self._curve_marker_visible = {}
         self._y_range_timer = QtCore.QTimer(self)
         self._y_range_timer.setSingleShot(True)
         self._y_range_timer.setInterval(40)
@@ -814,6 +816,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.time_col = time_col
         self._col_numeric_cache = {}
         self._col_block_absmax_cache = {}
+        self._curve_marker_visible = {}
         self.x_raw, self.x_display, self.is_time_axis = self._build_x_axis(df, time_col)
         self._hover_gap_threshold = self._compute_hover_gap_threshold()
 
@@ -958,6 +961,25 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 curve.setClipToView(True)
             except Exception:
                 pass
+            want_marker = visible_count <= int(self._marker_auto_threshold)
+            has_marker = bool(self._curve_marker_visible.get(col, False))
+            if want_marker != has_marker:
+                try:
+                    if want_marker:
+                        pen_obj = curve.opts.get("pen")
+                        if hasattr(pen_obj, "color"):
+                            marker_color = pen_obj.color()
+                        else:
+                            marker_color = pg.mkColor(220, 220, 220)
+                        curve.setSymbol("o")
+                        curve.setSymbolSize(4)
+                        curve.setSymbolPen(pg.mkPen((255, 255, 255, 120), width=0.6))
+                        curve.setSymbolBrush(pg.mkBrush(marker_color))
+                    else:
+                        curve.setSymbol(None)
+                except Exception:
+                    pass
+                self._curve_marker_visible[col] = want_marker
 
     def _open_csv_dialog(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1235,8 +1257,10 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 y,
                 pen=pg.mkPen(color=pg.intColor(i, hues=max(8, len(checked_cols))), width=2),
                 clipToView=True,
+                symbol=None,
             )
             self.curves[col] = curve
+            self._curve_marker_visible[col] = False
 
             if i > 0:
                 p.setXLink(self.plot_items[0])

@@ -993,9 +993,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
             if i > 0:
                 p.setXLink(self.plot_items[0])
-                p.hideAxis("bottom")
-            else:
-                p.setLabel("bottom", "时间" if self.is_time_axis else "样本点")
+            # 上方所有子图统一隐藏X轴刻度与标题，只在底部总览显示时间轴
+            p.hideAxis("bottom")
 
             vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((255, 80, 80), width=1))
             p.addItem(vline, ignoreBounds=True)
@@ -1014,11 +1013,13 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             )
 
         # 底部改成“时间进度条”样式：无波形、无Y轴，仅保留时间轴+可拖拽选区
+        # 这里提高固定高度，避免在多波形场景下看起来“像消失”。
         self.overview_plot.showGrid(x=False, y=False)
         self.overview_plot.hideAxis("left")
+        self.overview_plot.setTitle("时间总览")
         self.overview_plot.setLabel("bottom", "时间进度")
-        self.overview_plot.setMinimumHeight(46)
-        self.overview_plot.setMaximumHeight(58)
+        self.overview_plot.setMinimumHeight(84)
+        self.overview_plot.setMaximumHeight(108)
         self.overview_plot.disableAutoRange(axis=pg.ViewBox.YAxis)
         self.overview_plot.disableAutoRange(axis=pg.ViewBox.XAxis)
         self._localize_plot_context_menu(self.overview_plot)
@@ -1036,15 +1037,23 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         x_max = float(np.nanmax(self.x_display))
         if not np.isfinite(x_min) or not np.isfinite(x_max) or x_min == x_max:
             x_min, x_max = 0.0, max(1.0, float(len(self.x_display) - 1))
+        # 时间轴保留左右各1分钟缓冲；非时间轴保持原始边界
+        if self.is_time_axis:
+            x_min -= 60.0
+            x_max += 60.0
         self._x_domain_min = x_min
         self._x_domain_max = x_max
         self.overview_plot.setXRange(x_min, x_max, padding=0)
+        self.overview_plot.getViewBox().setLimits(xMin=x_min, xMax=x_max)
+
+        for p in self.plot_items:
+            p.getViewBox().setLimits(xMin=x_min, xMax=x_max)
 
         initial_left = x_min + (x_max - x_min) * 0.15
         initial_right = x_min + (x_max - x_min) * 0.65
         self.region = pg.LinearRegionItem(
             values=[initial_left, initial_right],
-            brush=pg.mkBrush(100, 100, 180, 45),
+            brush=pg.mkBrush(100, 100, 180, 70),
             pen=pg.mkPen((70, 70, 140), width=1),
         )
         self.region.setZValue(10)
@@ -1183,8 +1192,12 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         if left > right:
             left, right = right, left
 
-        x_min = float(np.nanmin(self.x_display))
-        x_max = float(np.nanmax(self.x_display))
+        if hasattr(self, "_x_domain_min") and hasattr(self, "_x_domain_max"):
+            x_min = float(self._x_domain_min)
+            x_max = float(self._x_domain_max)
+        else:
+            x_min = float(np.nanmin(self.x_display))
+            x_max = float(np.nanmax(self.x_display))
         left = max(x_min, min(left, x_max))
         right = max(x_min, min(right, x_max))
 

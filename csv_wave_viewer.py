@@ -510,6 +510,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.curves = {}
         self.vlines = []
         self.overview_plot = None
+        self.top_axis_plot = None
         self.hover_proxy = None
         self.selected_cols: List[str] = []
         self._syncing_from_region = False
@@ -1185,6 +1186,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.plot_cols.clear()
         self.curves.clear()
         self.vlines.clear()
+        self.top_axis_plot = None
         self.marker_slot_lines = [[], [], []]
         self.marker_bottom_label_items = [None, None, None]
         self.marker_bottom_xs = None
@@ -1199,12 +1201,30 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             self.value_display.setPlainText("请先勾选信号。")
             return
 
+        row_offset = 0
+        if self.is_time_axis:
+            top_axis_items = {"top": ConciseDateAxisItem(orientation="top", utcOffset=0)}
+            self.top_axis_plot = self.plot_widget.addPlot(row=0, col=0, title="", axisItems=top_axis_items)
+            self.top_axis_plot.hideAxis("left")
+            self.top_axis_plot.hideAxis("bottom")
+            self.top_axis_plot.showGrid(x=False, y=False)
+            self.top_axis_plot.setYRange(0.0, 1.0, padding=0)
+            self.top_axis_plot.setMinimumHeight(30)
+            self.top_axis_plot.setMaximumHeight(36)
+            self.top_axis_plot.setMouseEnabled(x=False, y=False)
+            self.top_axis_plot.setMenuEnabled(False)
+            self.top_axis_plot.getViewBox().setMouseEnabled(x=False, y=False)
+            self.top_axis_plot.getViewBox().setMenuEnabled(False)
+            self.top_axis_plot.getViewBox().setLimits(yMin=0.0, yMax=1.0)
+            self.top_axis_plot.setLabel("top", "")
+            row_offset = 1
+
         for i, col in enumerate(checked_cols):
             axis_items = self._make_axis_items()
             if axis_items is None:
-                p = self.plot_widget.addPlot(row=i, col=0, title=str(col))
+                p = self.plot_widget.addPlot(row=i + row_offset, col=0, title=str(col))
             else:
-                p = self.plot_widget.addPlot(row=i, col=0, title=str(col), axisItems=axis_items)
+                p = self.plot_widget.addPlot(row=i + row_offset, col=0, title=str(col), axisItems=axis_items)
 
             p.showGrid(x=True, y=True, alpha=0.25)
             p.setLabel("left", str(col))
@@ -1230,7 +1250,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             self.plot_cols.append(col)
             self._localize_plot_context_menu(p)
 
-        overview_row = len(checked_cols)
+        overview_row = len(checked_cols) + row_offset
         axis_items = self._make_axis_items()
         if axis_items is None:
             self.overview_plot = self.plot_widget.addPlot(row=overview_row, col=0, title="")
@@ -1243,7 +1263,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         # 这里提高固定高度，避免在多波形场景下看起来“像消失”。
         self.overview_plot.showGrid(x=False, y=False)
         self.overview_plot.hideAxis("left")
-        self.overview_plot.setTitle("时间总览")
+        self.overview_plot.setTitle("")
         self.overview_plot.setLabel("bottom", "时间进度")
         self.overview_plot.setMinimumHeight(84)
         self.overview_plot.setMaximumHeight(108)
@@ -1275,6 +1295,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
         for p in self.plot_items:
             p.getViewBox().setLimits(xMin=x_min, xMax=x_max)
+        if self.top_axis_plot is not None:
+            self.top_axis_plot.getViewBox().setLimits(xMin=x_min, xMax=x_max, yMin=0.0, yMax=1.0)
 
         initial_left = x_min + (x_max - x_min) * 0.15
         initial_right = x_min + (x_max - x_min) * 0.65
@@ -1283,10 +1305,18 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             brush=pg.mkBrush(100, 100, 180, 70),
             pen=pg.mkPen((70, 70, 140), width=1),
         )
+        # 增强左右边界手柄可见性与可命中性，便于拖拽调整窗口宽度
+        for edge in self.region.lines:
+            edge.setPen(pg.mkPen((72, 72, 150, 230), width=10))
+            edge.setHoverPen(pg.mkPen((56, 56, 130, 250), width=14))
         self.region.setZValue(10)
         self.overview_plot.addItem(self.region)
         self.region.sigRegionChanged.connect(self._on_region_changed)
         self._on_region_changed()
+
+        if self.top_axis_plot is not None and self.plot_items:
+            self.top_axis_plot.setXLink(self.plot_items[0])
+            self.top_axis_plot.setXRange(initial_left, initial_right, padding=0)
 
         # 在最后一张波形图底部显示“标记点N”（删除入口改到右侧面板）
         if self.plot_items:

@@ -585,11 +585,23 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
         self.marker_time_labels = []
         self.marker_text_edits = []
+        self.marker_clear_buttons = []
         for i in range(3):
             group = QtWidgets.QGroupBox(f"标记点{i + 1}")
             gv = QtWidgets.QVBoxLayout(group)
             gv.setContentsMargins(8, 8, 8, 8)
             gv.setSpacing(4)
+
+            btn_row = QtWidgets.QHBoxLayout()
+            btn_row.addStretch(1)
+            btn_clear = QtWidgets.QToolButton()
+            btn_clear.setText("×")
+            btn_clear.setToolTip(f"清除标记点{i + 1}")
+            btn_clear.setAutoRaise(True)
+            btn_clear.setFixedWidth(22)
+            btn_clear.clicked.connect(lambda _checked=False, slot=i: self._clear_marker(slot))
+            btn_row.addWidget(btn_clear)
+            gv.addLayout(btn_row)
 
             tlabel = QtWidgets.QLabel("未标记")
             tlabel.setStyleSheet("color: #555;")
@@ -605,6 +617,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
             self.marker_time_labels.append(tlabel)
             self.marker_text_edits.append(edit)
+            self.marker_clear_buttons.append(btn_clear)
             self.value_splitter.addWidget(group)
 
         vbox.addWidget(self.value_splitter, 1)
@@ -1055,12 +1068,9 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.region.sigRegionChanged.connect(self._on_region_changed)
         self._on_region_changed()
 
-        # 在最后一张波形图底部显示“标记点N + ×”并可点×删除
+        # 在最后一张波形图底部显示“标记点N”（删除入口改到右侧面板）
         if self.plot_items:
             bottom_plot = self.plot_items[-1]
-            self.marker_bottom_xs = pg.ScatterPlotItem(size=10, symbol="x", pen=pg.mkPen((200, 50, 50), width=1.8))
-            self.marker_bottom_xs.sigClicked.connect(self._on_bottom_marker_x_clicked)
-            bottom_plot.addItem(self.marker_bottom_xs)
             for slot in range(3):
                 txt = pg.TextItem(anchor=(0.5, 1.0), color=self.marker_colors[slot])
                 txt.hide()
@@ -1293,9 +1303,6 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         except Exception:
             return
 
-        if self._try_delete_marker_from_scene_click(pos):
-            return
-
         active_plot = None
         for p in self.plot_items:
             if p.sceneBoundingRect().contains(pos):
@@ -1396,8 +1403,6 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             return
 
         y_base = y_min + y_span * 0.02
-        x_offset = x_span * 0.018
-        spots_x = []
         self.marker_delete_targets = []
         for slot, snap in enumerate(self.marker_snapshots):
             label_item = self.marker_bottom_label_items[slot] if slot < len(self.marker_bottom_label_items) else None
@@ -1410,46 +1415,6 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 label_item.setText(f"标记点{slot + 1}", color=self.marker_colors[slot])
                 label_item.setPos(x, y_base)
                 label_item.show()
-
-            x_delete = x + x_offset
-            spots_x.append(
-                {
-                    "pos": (x_delete, y_base),
-                    "pen": pg.mkPen(210, 50, 50, width=1.8),
-                    "data": slot,
-                }
-            )
-            self.marker_delete_targets.append((slot, x_delete, y_base, x_span * 0.01, y_span * 0.08))
-        if self.marker_bottom_xs is not None:
-            self.marker_bottom_xs.setData(spots_x)
-
-    def _on_bottom_marker_x_clicked(self, _plot, points) -> None:
-        if not points:
-            return
-        try:
-            slot = int(points[0].data())
-        except Exception:
-            return
-        self._clear_marker(slot)
-
-    def _try_delete_marker_from_scene_click(self, scene_pos) -> bool:
-        if not self.plot_items:
-            return False
-        bottom_plot = self.plot_items[-1]
-        if not bottom_plot.sceneBoundingRect().contains(scene_pos):
-            return False
-        try:
-            pt = bottom_plot.vb.mapSceneToView(scene_pos)
-            xv = float(pt.x())
-            yv = float(pt.y())
-        except Exception:
-            return False
-
-        for slot, x0, y0, tx, ty in self.marker_delete_targets:
-            if abs(xv - x0) <= tx and abs(yv - y0) <= ty:
-                self._clear_marker(slot)
-                return True
-        return False
 
     def _clear_marker(self, idx: int) -> None:
         if idx < 0 or idx >= len(self.marker_snapshots):

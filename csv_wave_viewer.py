@@ -537,12 +537,16 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._hover_gap_threshold = 0.0
         self._hover_snap_threshold = 0.0
         self._hover_gap_limit = 0.0
+        self._hover_base_step = 0.0
+        self._hover_carry_limit = 0.0
         self._col_numeric_cache = {}
         self._col_block_absmax_cache = {}
+        self._col_valid_idx_cache = {}
         self._absmax_block_size = 512
         self._large_data_mode = False
         self._marker_auto_threshold = 3000
         self._curve_marker_visible = {}
+        self._syncing_selected_panel = False
         self._y_range_timer = QtCore.QTimer(self)
         self._y_range_timer.setSingleShot(True)
         self._y_range_timer.setInterval(40)
@@ -564,6 +568,21 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         open_action = QtGui.QAction("打开CSV", self)
         open_action.triggered.connect(self._open_csv_dialog)
         toolbar.addAction(open_action)
+
+        help_action = QtGui.QAction("说明", self)
+        help_action.triggered.connect(self._show_usage_dialog)
+        toolbar.addAction(help_action)
+
+    def _show_usage_dialog(self) -> None:
+        text = (
+            "使用说明:\n"
+            "1) 在左侧搜索并勾选信号（默认不勾选）\n"
+            "2) 勾选一个就会在右侧新增一个波形\n"
+            "3) 底部总览图拖拽灰色区域选择时间段\n"
+            "4) 鼠标移动到任意子图，右侧显示当前时刻各信号值\n"
+            "5) 可将当前勾选信号保存为收藏并一键恢复"
+        )
+        QtWidgets.QMessageBox.information(self, "使用说明", text)
 
     def _build_x_axis(self, df: pd.DataFrame, time_col: Optional[str]) -> Tuple[np.ndarray, np.ndarray, bool]:
         if time_col is None:
@@ -605,6 +624,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
         self.signal_list = QtWidgets.QListWidget()
         self.signal_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.signal_list.setMaximumHeight(560)
         for col in self.numeric_cols:
             item = QtWidgets.QListWidgetItem(col)
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
@@ -619,37 +639,65 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         btn_row.addWidget(self.btn_none)
         vbox.addLayout(btn_row)
 
-        fav_title = QtWidgets.QLabel("收藏")
-        fav_title.setStyleSheet("font-weight: bold;")
-        vbox.addWidget(fav_title)
+        mode_row = QtWidgets.QHBoxLayout()
+        self.btn_mode_fav = QtWidgets.QPushButton("收藏")
+        self.btn_mode_signal = QtWidgets.QPushButton("信号")
+        self.btn_mode_signal.setCheckable(True)
+        self.btn_mode_fav.setCheckable(True)
+        self.btn_mode_fav.setChecked(True)
+        self.mode_btn_group = QtWidgets.QButtonGroup(panel)
+        self.mode_btn_group.setExclusive(True)
+        self.mode_btn_group.addButton(self.btn_mode_signal, 0)
+        self.mode_btn_group.addButton(self.btn_mode_fav, 1)
+        mode_row.addWidget(self.btn_mode_fav)
+        mode_row.addWidget(self.btn_mode_signal)
+        vbox.addLayout(mode_row)
 
-        self.fav_combo = QtWidgets.QComboBox()
-        self._refresh_favorites_combo()
-        vbox.addWidget(self.fav_combo)
+        self.mode_stack = QtWidgets.QStackedWidget()
+        vbox.addWidget(self.mode_stack, 0)
+
+        signal_page = QtWidgets.QWidget()
+        signal_layout = QtWidgets.QVBoxLayout(signal_page)
+        signal_layout.setContentsMargins(0, 0, 0, 0)
+        signal_layout.setSpacing(6)
+        selected_title = QtWidgets.QLabel("已选信号")
+        selected_title.setStyleSheet("font-weight: bold;")
+        signal_layout.addWidget(selected_title)
+        self.selected_signal_list = QtWidgets.QListWidget()
+        self.selected_signal_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.selected_signal_list.setMinimumHeight(110)
+        signal_layout.addWidget(self.selected_signal_list, 1)
+        self.mode_stack.addWidget(signal_page)  # index 0
+
+        fav_page = QtWidgets.QWidget()
+        fav_layout = QtWidgets.QVBoxLayout(fav_page)
+        fav_layout.setContentsMargins(0, 0, 0, 0)
+        fav_layout.setSpacing(6)
+        fav_title = QtWidgets.QLabel("收藏操作")
+        fav_title.setStyleSheet("font-weight: bold;")
+        fav_layout.addWidget(fav_title)
 
         fav_btn_row1 = QtWidgets.QHBoxLayout()
         self.btn_fav_save = QtWidgets.QPushButton("收藏当前")
         self.btn_fav_apply = QtWidgets.QPushButton("应用收藏")
         fav_btn_row1.addWidget(self.btn_fav_save)
         fav_btn_row1.addWidget(self.btn_fav_apply)
-        vbox.addLayout(fav_btn_row1)
+        fav_layout.addLayout(fav_btn_row1)
 
         fav_btn_row2 = QtWidgets.QHBoxLayout()
         self.btn_fav_delete = QtWidgets.QPushButton("删除收藏")
         fav_btn_row2.addWidget(self.btn_fav_delete)
-        vbox.addLayout(fav_btn_row2)
+        fav_layout.addLayout(fav_btn_row2)
 
-        tips = QtWidgets.QLabel(
-            "使用说明:\n"
-            "1) 在左侧搜索并勾选信号（默认不勾选）\n"
-            "2) 勾选一个就会在右侧新增一个波形\n"
-            "3) 底部总览图拖拽灰色区域选择时间段\n"
-            "4) 鼠标移动到任意子图，右侧显示当前时刻各信号值\n"
-            "5) 可将当前勾选信号保存为收藏并一键恢复"
-        )
-        tips.setWordWrap(True)
-        tips.setStyleSheet("color: #555;")
-        vbox.addWidget(tips)
+        fav_name_title = QtWidgets.QLabel("已收藏名称")
+        fav_name_title.setStyleSheet("font-weight: bold;")
+        fav_layout.addWidget(fav_name_title)
+        self.fav_name_list = QtWidgets.QListWidget()
+        self.fav_name_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.fav_name_list.setMinimumHeight(90)
+        fav_layout.addWidget(self.fav_name_list, 1)
+        self._refresh_favorite_name_list()
+        self.mode_stack.addWidget(fav_page)  # index 1
 
         return panel
 
@@ -739,9 +787,15 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.btn_all.clicked.connect(self._select_all)
         self.btn_none.clicked.connect(self._select_none)
         self.search_edit.textChanged.connect(self._filter_signals)
+        self.selected_signal_list.itemChanged.connect(self._on_selected_signal_item_changed)
+        self.mode_btn_group.buttonClicked.connect(
+            lambda _btn: self.mode_stack.setCurrentIndex(self.mode_btn_group.checkedId())
+        )
         self.btn_fav_save.clicked.connect(self._save_current_favorite)
         self.btn_fav_apply.clicked.connect(self._apply_selected_favorite)
         self.btn_fav_delete.clicked.connect(self._delete_selected_favorite)
+        self.fav_name_list.itemClicked.connect(self._on_favorite_name_clicked)
+        self.mode_stack.setCurrentIndex(1)
 
     def _localize_menu_recursive(self, menu: QtWidgets.QMenu) -> None:
         if self._menu_localizing:
@@ -818,6 +872,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.time_col = time_col
         self._col_numeric_cache = {}
         self._col_block_absmax_cache = {}
+        self._col_valid_idx_cache = {}
         self._curve_marker_visible = {}
         self.x_raw, self.x_display, self.is_time_axis = self._build_x_axis(df, time_col)
         self._recompute_hover_rules()
@@ -856,6 +911,15 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         arr = pd.to_numeric(self.df[col], errors="coerce").to_numpy(dtype=np.float64)
         self._col_numeric_cache[col] = arr
         return arr
+
+    def _get_valid_indices_for_col(self, col: str) -> np.ndarray:
+        cached = self._col_valid_idx_cache.get(col)
+        if cached is not None:
+            return cached
+        arr = self._get_numeric_column_array(col)
+        valid_idx = np.flatnonzero(np.isfinite(arr)).astype(np.int64)
+        self._col_valid_idx_cache[col] = valid_idx
+        return valid_idx
 
     def _get_absmax_blocks(self, col: str) -> np.ndarray:
         cached = self._col_block_absmax_cache.get(col)
@@ -1094,17 +1158,65 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             if self.signal_list.item(i).checkState() == QtCore.Qt.Checked:
                 selected += 1
         self.selected_count_label.setText(f"已选 {selected} / {self.signal_list.count()}")
+        self._refresh_selected_signal_panel()
+
+    def _refresh_selected_signal_panel(self) -> None:
+        if not hasattr(self, "selected_signal_list") or self.selected_signal_list is None:
+            return
+        self._syncing_selected_panel = True
+        self.selected_signal_list.clear()
+        checked = self._get_checked_columns()
+        if not checked:
+            self.selected_signal_list.addItem("（当前未选信号）")
+            self._syncing_selected_panel = False
+            return
+        for name in checked:
+            item = QtWidgets.QListWidgetItem(name)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked)
+            self.selected_signal_list.addItem(item)
+        self._syncing_selected_panel = False
+
+    def _on_selected_signal_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
+        if self._syncing_selected_panel:
+            return
+        name = item.text().strip()
+        if not name or name.startswith("（"):
+            return
+        target_state = item.checkState()
+        self.signal_list.blockSignals(True)
+        try:
+            for i in range(self.signal_list.count()):
+                src_item = self.signal_list.item(i)
+                if src_item.text() == name:
+                    src_item.setCheckState(target_state)
+                    break
+        finally:
+            self.signal_list.blockSignals(False)
+        self._update_selected_count()
+        self._init_plots()
 
     def _refresh_favorites_combo(self) -> None:
-        if not hasattr(self, "fav_combo") or self.fav_combo is None:
+        # 兼容旧调用，统一转发到收藏列表刷新
+        self._refresh_favorite_name_list()
+
+    def _refresh_favorite_name_list(self) -> None:
+        if not hasattr(self, "fav_name_list") or self.fav_name_list is None:
             return
-        current = self.fav_combo.currentText().strip()
-        self.fav_combo.clear()
-        self.fav_combo.addItem("（请选择收藏）")
+        current = ""
+        cur_item = self.fav_name_list.currentItem()
+        if cur_item is not None:
+            current = cur_item.text().strip()
+        self.fav_name_list.clear()
         for name in sorted(self.favorites.keys()):
-            self.fav_combo.addItem(name)
+            self.fav_name_list.addItem(name)
         if current and current in self.favorites:
-            self.fav_combo.setCurrentText(current)
+            matched = self.fav_name_list.findItems(current, QtCore.Qt.MatchExactly)
+            if matched:
+                self.fav_name_list.setCurrentItem(matched[0])
+
+    def _on_favorite_name_clicked(self, item: QtWidgets.QListWidgetItem) -> None:
+        _ = item
 
     def _read_favorites(self) -> dict:
         if not os.path.exists(self.favorites_path):
@@ -1132,9 +1244,13 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "提示", "请先勾选至少一个信号再收藏。")
             return
 
-        default_name = self.fav_combo.currentText().strip()
-        if default_name in ("", "（请选择收藏）"):
-            default_name = "我的收藏"
+        default_name = "我的收藏"
+        if hasattr(self, "fav_name_list") and self.fav_name_list is not None:
+            cur_item = self.fav_name_list.currentItem()
+            if cur_item is not None:
+                txt = cur_item.text().strip()
+                if txt:
+                    default_name = txt
 
         name, ok = QtWidgets.QInputDialog.getText(self, "收藏当前选择", "请输入收藏名称：", text=default_name)
         if not ok:
@@ -1158,12 +1274,18 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.favorites[name] = cols
         self._write_favorites()
         self._refresh_favorites_combo()
-        self.fav_combo.setCurrentText(name)
+        matched = self.fav_name_list.findItems(name, QtCore.Qt.MatchExactly) if hasattr(self, "fav_name_list") else []
+        if matched:
+            self.fav_name_list.setCurrentItem(matched[0])
         self.statusBar().showMessage(f"已保存收藏: {name}（{len(cols)}个信号）")
 
     def _apply_selected_favorite(self) -> None:
-        name = self.fav_combo.currentText().strip()
-        if not name or name == "（请选择收藏）":
+        name = ""
+        if hasattr(self, "fav_name_list") and self.fav_name_list is not None:
+            cur_item = self.fav_name_list.currentItem()
+            if cur_item is not None:
+                name = cur_item.text().strip()
+        if not name:
             QtWidgets.QMessageBox.information(self, "提示", "请先选择一个收藏。")
             return
         if name not in self.favorites:
@@ -1191,8 +1313,12 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"已应用收藏: {name}（匹配{matched}，缺失{missing}）")
 
     def _delete_selected_favorite(self) -> None:
-        name = self.fav_combo.currentText().strip()
-        if not name or name == "（请选择收藏）":
+        name = ""
+        if hasattr(self, "fav_name_list") and self.fav_name_list is not None:
+            cur_item = self.fav_name_list.currentItem()
+            if cur_item is not None:
+                name = cur_item.text().strip()
+        if not name:
             QtWidgets.QMessageBox.information(self, "提示", "请先选择要删除的收藏。")
             return
         if name not in self.favorites:
@@ -1234,6 +1360,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             self.value_display.setPlainText("请先勾选信号。")
             return
 
+        unified_left_axis_width = 58
+
         row_offset = 0
         if self.is_time_axis:
             top_axis_items = {"top": ConciseDateAxisItem(orientation="top", utcOffset=0)}
@@ -1250,6 +1378,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             self.top_axis_plot.getViewBox().setMenuEnabled(False)
             self.top_axis_plot.getViewBox().setLimits(yMin=0.0, yMax=1.0)
             self.top_axis_plot.setLabel("top", "")
+            self.top_axis_plot.getAxis("left").setWidth(unified_left_axis_width)
             row_offset = 1
 
         for i, col in enumerate(checked_cols):
@@ -1260,7 +1389,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
                 p = self.plot_widget.addPlot(row=i + row_offset, col=0, title=str(col), axisItems=axis_items)
 
             p.showGrid(x=True, y=True, alpha=0.25)
-            p.setLabel("left", str(col))
+            p.setLabel("left", "")
+            p.getAxis("left").setWidth(unified_left_axis_width)
 
             y = self._get_numeric_column_array(col)
             curve = p.plot(
@@ -1306,6 +1436,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.overview_plot.disableAutoRange(axis=pg.ViewBox.XAxis)
         self._localize_plot_context_menu(self.overview_plot)
         self.overview_plot.setYRange(0.0, 1.0, padding=0)
+        self.overview_plot.getAxis("left").setWidth(unified_left_axis_width)
 
         # 每个标记点在所有子图保留一条固定竖线
         for p in self.plot_items:
@@ -1858,6 +1989,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._hover_gap_threshold = 0.0
         self._hover_snap_threshold = 0.0
         self._hover_gap_limit = 0.0
+        self._hover_base_step = 0.0
+        self._hover_carry_limit = 0.0
         if self.x_display.size < 2:
             return
 
@@ -1875,9 +2008,13 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
         # 断档阈值：超过该阈值的区间视为“空档”，禁止吸附
         gap_limit = max(5.0 * dt_median, 60.0 if self.is_time_axis else 2.0)
+        base_step = max(dt_median, dt_min)
+        carry_limit = 2.0 * base_step
 
         self._hover_snap_threshold = float(snap)
         self._hover_gap_limit = float(gap_limit)
+        self._hover_base_step = float(base_step)
+        self._hover_carry_limit = float(carry_limit)
         # 兼容旧变量名
         self._hover_gap_threshold = self._hover_snap_threshold
 
@@ -1927,17 +2064,52 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             lines.append(f"样本位置: {x_cursor:.3f}")
 
         for col in self.selected_cols:
-            sval = ""
-            if idx is not None:
-                arr = self._get_numeric_column_array(col)
-                val = arr[idx] if 0 <= idx < len(arr) else np.nan
-                if not pd.isna(val):
-                    try:
-                        sval = f"{float(val):.6g}"
-                    except Exception:
-                        sval = str(val)
+            sval = self._resolve_hover_value_for_col(col, x_cursor, idx)
             lines.append(f"{col}: {sval}")
         return lines
+
+    def _resolve_hover_value_for_col(self, col: str, x_cursor: float, idx: Optional[int]) -> str:
+        arr = self._get_numeric_column_array(col)
+        n = len(arr)
+        if n == 0:
+            return ""
+
+        # 1) 先尝试当前吸附点
+        if idx is not None and 0 <= idx < n and np.isfinite(arr[idx]):
+            try:
+                return f"{float(arr[idx]):.6g}"
+            except Exception:
+                return str(arr[idx])
+
+        # 2) 再按该信号独立顺延“上一帧有效值”
+        valid_idx = self._get_valid_indices_for_col(col)
+        if valid_idx.size == 0:
+            return ""
+
+        pos = int(np.searchsorted(self.x_display[valid_idx], x_cursor, side="right")) - 1
+        if pos < 0:
+            return ""
+        prev_i = int(valid_idx[pos])
+        prev_t = float(self.x_display[prev_i])
+        lag = float(x_cursor - prev_t)
+        if not np.isfinite(lag) or lag < 0:
+            return ""
+
+        carry_limit = float(self._hover_carry_limit)
+        if carry_limit <= 0.0:
+            carry_limit = float(self._hover_snap_threshold)
+        if carry_limit <= 0.0:
+            return ""
+        if lag > carry_limit:
+            return ""
+
+        v = arr[prev_i]
+        if not np.isfinite(v):
+            return ""
+        try:
+            return f"{float(v):.6g}"
+        except Exception:
+            return str(v)
 
     def _update_current_value_panel_by_x(self, x_cursor: float) -> None:
         idx = self._pick_hover_index(x_cursor)

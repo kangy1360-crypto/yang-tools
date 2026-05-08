@@ -1,6 +1,5 @@
 ﻿import argparse
 import faulthandler
-import hashlib
 import json
 import logging
 import os
@@ -172,6 +171,31 @@ class ConciseDateAxisItem(pg.DateAxisItem):
         return out
 
 
+class LinearStepScrollBar(QtWidgets.QScrollBar):
+    """让滚轮滚动按固定步进移动，避免系统滚轮行数导致一次跳太多。"""
+
+    def __init__(self, orientation: QtCore.Qt.Orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._wheel_remainder = 0
+
+    def wheelEvent(self, event) -> None:
+        delta = int(event.angleDelta().y())
+        if delta == 0:
+            event.accept()
+            return
+
+        self._wheel_remainder += delta
+        steps = int(self._wheel_remainder / 120)
+        if steps == 0:
+            event.accept()
+            return
+
+        self._wheel_remainder -= steps * 120
+        step_size = max(1, int(self.singleStep()))
+        self.setValue(self.value() - steps * step_size)
+        event.accept()
+
+
 def detect_time_column(columns: List[str]) -> Optional[str]:
     keywords = ("时间", "time", "timestamp", "date", "日期")
     for col in columns:
@@ -326,61 +350,6 @@ class CsvLoadWorker(QtCore.QObject):
     def request_cancel(self) -> None:
         self._cancel_requested = True
 
-    def _cache_paths(self) -> Tuple[str, str]:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        cache_dir = os.path.join(base_dir, "_data_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        abs_path = os.path.abspath(self.path)
-        key = hashlib.sha1(abs_path.encode("utf-8", errors="ignore")).hexdigest()
-        return (
-            os.path.join(cache_dir, f"{key}.pkl"),
-            os.path.join(cache_dir, f"{key}.meta.json"),
-        )
-
-    def _load_from_cache_if_valid(self) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-        data_path, meta_path = self._cache_paths()
-        if not (os.path.exists(data_path) and os.path.exists(meta_path)):
-            return None, None
-
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            st = os.stat(self.path)
-            if int(meta.get("source_size", -1)) != int(st.st_size):
-                return None, None
-            if int(meta.get("source_mtime_ns", -1)) != int(st.st_mtime_ns):
-                return None, None
-
-            self.progress.emit(8, "命中本地缓存，正在读取...")
-            df = pd.read_pickle(data_path)
-            cached_time_col = meta.get("time_col")
-            if isinstance(cached_time_col, str) and cached_time_col in df.columns:
-                time_col = cached_time_col
-            else:
-                time_col = None
-            return df, time_col
-        except Exception:
-            return None, None
-
-    def _write_cache_best_effort(self, df: pd.DataFrame, time_col: Optional[str]) -> None:
-        try:
-            data_path, meta_path = self._cache_paths()
-            st = os.stat(self.path)
-            df.to_pickle(data_path)
-            meta = {
-                "schema_version": 1,
-                "source_path": os.path.abspath(self.path),
-                "source_size": int(st.st_size),
-                "source_mtime_ns": int(st.st_mtime_ns),
-                "rows": int(len(df)),
-                "cols": int(len(df.columns)),
-                "time_col": time_col if isinstance(time_col, str) else None,
-            }
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
     def _count_lines(self) -> int:
         size = max(1, os.path.getsize(self.path))
         line_count = 0
@@ -399,25 +368,6 @@ class CsvLoadWorker(QtCore.QObject):
         return max(1, line_count)
 
     def run(self) -> None:
-        self.progress.emit(1, "检查本地缓存...")
-        cached_df, cached_time_col = self._load_from_cache_if_valid()
-        if cached_df is not None:
-            if self._cancel_requested:
-                self.canceled.emit()
-                return
-
-            time_col = self.forced_time_col
-            if time_col is not None and time_col not in cached_df.columns:
-                time_col = None
-            if time_col is None:
-                time_col = cached_time_col
-            if time_col is None:
-                time_col = detect_best_time_column(cached_df)
-
-            self.progress.emit(100, "缓存加载完成")
-            self.finished.emit(cached_df, time_col, os.path.basename(self.path), "cache_hit")
-            return
-
         encodings = ["gbk", "utf-8-sig", "utf-8"]
         errors = []
 
@@ -461,8 +411,6 @@ class CsvLoadWorker(QtCore.QObject):
                 if time_col is None:
                     time_col = detect_best_time_column(df)
 
-                self.progress.emit(96, "写入本地缓存...")
-                self._write_cache_best_effort(df, time_col)
                 self.progress.emit(100, "加载完成")
                 self.finished.emit(df, time_col, os.path.basename(self.path), "csv_loaded")
                 return
@@ -486,24 +434,101 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.numeric_cols: List[str] = []
 
         self.left_panel = QtWidgets.QFrame()
+        self.left_panel_host = QtWidgets.QFrame()
+        self.left_panel_host.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.left_panel_host.setMinimumWidth(300)
+        self.left_panel_host.setMaximumWidth(900)
+        self.left_panel_host_layout = QtWidgets.QVBoxLayout(self.left_panel_host)
+        self.left_panel_host_layout.setContentsMargins(0, 0, 0, 0)
+        self.left_panel_host_layout.setSpacing(0)
+        self.left_panel_host_layout.addWidget(self.left_panel)
         self.plot_widget = self._build_plot_area()
+        self.plot_page_slider = LinearStepScrollBar(QtCore.Qt.Vertical)
+        self.plot_page_slider.setMinimum(0)
+        self.plot_page_slider.setMaximum(0)
+        self.plot_page_slider.setSingleStep(1)
+        self.plot_page_slider.setPageStep(2)
+        self.plot_page_slider.setValue(0)
+        self.plot_page_slider.setInvertedAppearance(False)
+        self.plot_page_slider.setToolTip("")
+        self.plot_page_slider.setFixedWidth(16)
+        self.plot_page_slider.setStyleSheet(
+            """
+            QScrollBar:vertical {
+                background: #f1f3f5;
+                width: 16px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #8b939a;
+                min-height: 44px;
+                border-radius: 6px;
+                border: 1px solid #7a838b;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #747d86;
+                border: 1px solid #67717a;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                background: transparent;
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: #e5e8ec;
+            }
+            """
+        )
+        self.plot_page_slider.hide()
+        self.plot_page_slider.valueChanged.connect(self._on_plot_page_slider_changed)
+        self.plot_area_panel = QtWidgets.QWidget()
+        self.plot_area_layout = QtWidgets.QHBoxLayout(self.plot_area_panel)
+        self.plot_area_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_area_layout.setSpacing(0)
+        self.plot_area_layout.addWidget(self.plot_widget, 1)
+        self.plot_area_layout.addWidget(self.plot_page_slider, 0)
         self.value_panel = self._build_value_panel()
+        self._default_plot_width = 980
+        self._default_side_panel_width = 520
+        self._max_visible_plot_count = 9
+        self._plot_page_start = 0
         self.plot_value_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        self.plot_value_splitter.addWidget(self.plot_widget)
+        self.plot_value_splitter.addWidget(self.plot_area_panel)
         self.plot_value_splitter.addWidget(self.value_panel)
         self.plot_value_splitter.setChildrenCollapsible(False)
         self.plot_value_splitter.setHandleWidth(6)
         self.plot_value_splitter.setStretchFactor(0, 1)
         self.plot_value_splitter.setStretchFactor(1, 0)
+        self.main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(10)
+        self.main_splitter.addWidget(self.left_panel_host)
+        self.main_splitter.addWidget(self.plot_value_splitter)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setCollapsible(0, False)
+        self.main_splitter.setCollapsible(1, False)
+        # 让左侧默认宽度与右侧数值面板默认宽度一致。
+        self.main_splitter.setSizes([self._default_side_panel_width, self._default_plot_width + self._default_side_panel_width])
+        self.main_splitter.setStyleSheet(
+            """
+            QSplitter::handle {
+                background: #c5ccd4;
+            }
+            QSplitter::handle:hover {
+                background: #7f8c99;
+            }
+            """
+        )
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(central)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
-        layout.addWidget(self.left_panel, 0)
-        layout.addWidget(self.plot_value_splitter, 1)
+        layout.setSpacing(0)
+        layout.addWidget(self.main_splitter, 1)
         self.setCentralWidget(central)
-        self.plot_value_splitter.setSizes([980, 520])
+        self.plot_value_splitter.setSizes([self._default_plot_width, self._default_side_panel_width])
 
         self.plot_items = []
         self.plot_cols: List[str] = []
@@ -547,6 +572,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._marker_auto_threshold = 3000
         self._curve_marker_visible = {}
         self._syncing_selected_panel = False
+        self._main_splitter_default_applied = False
         self._y_range_timer = QtCore.QTimer(self)
         self._y_range_timer.setSingleShot(True)
         self._y_range_timer.setInterval(40)
@@ -604,7 +630,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         panel = QtWidgets.QFrame()
         panel.setFrameShape(QtWidgets.QFrame.StyledPanel)
         panel.setMinimumWidth(300)
-        panel.setMaximumWidth(360)
+        panel.setMaximumWidth(900)
 
         vbox = QtWidgets.QVBoxLayout(panel)
         vbox.setContentsMargins(10, 10, 10, 10)
@@ -703,6 +729,36 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
     def _build_plot_area(self) -> pg.GraphicsLayoutWidget:
         return pg.GraphicsLayoutWidget()
+
+    def _slice_visible_plot_columns(self, checked_cols: List[str]) -> List[str]:
+        total = len(checked_cols)
+        if total <= self._max_visible_plot_count:
+            self._plot_page_start = 0
+            self.plot_page_slider.blockSignals(True)
+            self.plot_page_slider.setMinimum(0)
+            self.plot_page_slider.setMaximum(0)
+            self.plot_page_slider.setValue(0)
+            self.plot_page_slider.blockSignals(False)
+            self.plot_page_slider.hide()
+            return checked_cols
+
+        max_start = max(0, total - self._max_visible_plot_count)
+        self._plot_page_start = max(0, min(int(self._plot_page_start), max_start))
+
+        self.plot_page_slider.blockSignals(True)
+        self.plot_page_slider.setMinimum(0)
+        self.plot_page_slider.setMaximum(max_start)
+        self.plot_page_slider.setSingleStep(1)
+        self.plot_page_slider.setPageStep(2)
+        self.plot_page_slider.setValue(self._plot_page_start)
+        self.plot_page_slider.blockSignals(False)
+        self.plot_page_slider.show()
+        end = self._plot_page_start + self._max_visible_plot_count
+        return checked_cols[self._plot_page_start:end]
+
+    def _on_plot_page_slider_changed(self, value: int) -> None:
+        self._plot_page_start = max(0, int(value))
+        self._init_plots()
 
     def _build_value_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QFrame()
@@ -874,6 +930,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self._col_block_absmax_cache = {}
         self._col_valid_idx_cache = {}
         self._curve_marker_visible = {}
+        self._plot_page_start = 0
         self.x_raw, self.x_display, self.is_time_axis = self._build_x_axis(df, time_col)
         self._recompute_hover_rules()
 
@@ -885,12 +942,22 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             raise ValueError("CSV中没有可绘制的数值列。")
         self._update_performance_mode()
 
+        old_sizes = self.main_splitter.sizes()
         new_left = self._build_left_panel()
         old_left = self.left_panel
-        parent_layout = self.centralWidget().layout()
-        parent_layout.replaceWidget(old_left, new_left)
+        self.left_panel_host_layout.replaceWidget(old_left, new_left)
         old_left.deleteLater()
         self.left_panel = new_left
+
+        if not self._main_splitter_default_applied:
+            self.main_splitter.setSizes(
+                [self._default_side_panel_width, self._default_plot_width + self._default_side_panel_width]
+            )
+            self._main_splitter_default_applied = True
+        elif old_sizes and len(old_sizes) >= 2 and old_sizes[0] > 0:
+            keep_left = max(self.left_panel_host.minimumWidth(), int(old_sizes[0]))
+            keep_left = min(self.left_panel_host.maximumWidth(), keep_left)
+            self.main_splitter.setSizes([keep_left, max(1, int(old_sizes[1]))])
 
         self._bind_left_signals()
         self._update_selected_count()
@@ -1114,11 +1181,10 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         try:
             self._set_data(df, time_col)
             self.setWindowTitle(f"CSV多信号波形查看器 - {file_name}")
-            source_hint = "（缓存）" if load_source == "cache_hit" else ""
             if time_col is None:
-                self.statusBar().showMessage(f"加载完成{source_hint}: {file_name}（未识别到时间列，当前为样本轴）")
+                self.statusBar().showMessage(f"加载完成: {file_name}（未识别到时间列，当前为样本轴）")
             else:
-                self.statusBar().showMessage(f"加载完成{source_hint}: {file_name}（时间列: {time_col}）")
+                self.statusBar().showMessage(f"加载完成: {file_name}（时间列: {time_col}）")
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "加载失败", str(exc))
 
@@ -1340,6 +1406,13 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"已删除收藏: {name}")
 
     def _init_plots(self) -> None:
+        prev_region = None
+        if hasattr(self, "region"):
+            try:
+                prev_region = tuple(self.region.getRegion())
+            except Exception:
+                prev_region = None
+
         self.plot_widget.clear()
         self.plot_items.clear()
         self.plot_cols.clear()
@@ -1353,6 +1426,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
 
         checked_cols = self._get_checked_columns()
         self.selected_cols = checked_cols
+        visible_cols = self._slice_visible_plot_columns(checked_cols)
 
         if not checked_cols:
             label = self.plot_widget.addLabel("请在左侧勾选信号后显示波形", row=0, col=0)
@@ -1381,7 +1455,8 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             self.top_axis_plot.getAxis("left").setWidth(unified_left_axis_width)
             row_offset = 1
 
-        for i, col in enumerate(checked_cols):
+        for i, col in enumerate(visible_cols):
+            color_index = self._plot_page_start + i
             axis_items = self._make_axis_items()
             if axis_items is None:
                 p = self.plot_widget.addPlot(row=i + row_offset, col=0, title=str(col))
@@ -1396,7 +1471,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             curve = p.plot(
                 self.x_display,
                 y,
-                pen=pg.mkPen(color=pg.intColor(i, hues=max(8, len(checked_cols))), width=2),
+                pen=pg.mkPen(color=pg.intColor(color_index, hues=max(8, len(checked_cols))), width=2),
                 clipToView=True,
                 symbol=None,
             )
@@ -1415,7 +1490,7 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             self.plot_cols.append(col)
             self._localize_plot_context_menu(p)
 
-        overview_row = len(checked_cols) + row_offset
+        overview_row = len(visible_cols) + row_offset
         axis_items = self._make_axis_items()
         if axis_items is None:
             self.overview_plot = self.plot_widget.addPlot(row=overview_row, col=0, title="")
@@ -1464,8 +1539,17 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
         if self.top_axis_plot is not None:
             self.top_axis_plot.getViewBox().setLimits(xMin=x_min, xMax=x_max, yMin=0.0, yMax=1.0)
 
-        initial_left = x_min + (x_max - x_min) * 0.15
-        initial_right = x_min + (x_max - x_min) * 0.65
+        if prev_region is not None and len(prev_region) == 2:
+            initial_left, initial_right = self._clamp_x_window(
+                float(prev_region[0]),
+                float(prev_region[1]),
+                x_min,
+                x_max,
+                prefer_width=float(prev_region[1] - prev_region[0]),
+            )
+        else:
+            initial_left = x_min + (x_max - x_min) * 0.15
+            initial_right = x_min + (x_max - x_min) * 0.65
         self.region = pg.LinearRegionItem(
             values=[initial_left, initial_right],
             brush=pg.mkBrush(100, 100, 180, 70),
@@ -1798,7 +1882,10 @@ class CsvWaveViewer(QtWidgets.QMainWindow):
             if abs(delta) < 1e-12:
                 return super().eventFilter(obj, event)
 
-            scale = 1.15 if delta > 0 else (1.0 / 1.15)
+            wheel_up = delta > 0
+            zoom_factor = 1.15
+            # 滚轮方向约定：向上滚看更全，向下滚看更细。
+            scale = zoom_factor if wheel_up else (1.0 / zoom_factor)
             target_width = cur_width * scale
             min_width = max(1e-6 * span, 1e-6)
             target_width = max(min_width, min(target_width, span))
